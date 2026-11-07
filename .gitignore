@@ -1,0 +1,12 @@
+# Never commit generated credentials, client links, keys, or local configs
+*reality-client*.txt
+*.key
+*.pem
+*.env
+.env.*
+guiNDB.db*
+guiNConfig.json*
+config.json
+*.bak*
+*.log
+.DS_Store

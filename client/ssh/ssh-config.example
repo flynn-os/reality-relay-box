@@ -1,0 +1,63 @@
+# =============================================================================
+# Stealth Cross-Border SSH Jump / Reverse-Tunnel Configuration Example
+# =============================================================================
+# Why this matters:
+#   Running raw 24/7 SSH or `autossh` tunnels directly to your Entry Relay VPS
+#   exposes plaintext `SSH-2.0-OpenSSH` banners and fixed-size keepalive packets
+#   on the same IP as your port 443 proxy. Firewalls correlate multi-port
+#   activity from the same client IP and block the Entry VPS IP.
+#
+# Solution:
+#   Use `ProxyCommand` to route SSH connections INSIDE your local VLESS+REALITY
+#   SOCKS5 proxy (127.0.0.1:10808) directly to the Exit VPS's SSH port, with
+#   automatic fallback to direct TCP (port 2222) only if the local proxy is down.
+#   Result: ZERO raw SSH packets cross the firewall during normal operation.
+#
+# Replace the RFC 5737 example IPs below with your own:
+#   198.51.100.10 -> Your Entry Relay VPS Public IP
+#   203.0.113.20  -> Your Fixed-Exit VPS Public IP
+# =============================================================================
+
+# --- macOS Client (~/.ssh/config) ---
+Host vps-jump
+    HostName 198.51.100.10
+    Port 2222
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    # Prefer local REALITY SOCKS5 proxy (127.0.0.1:10808); auto-fallback to direct if proxy is down
+    ProxyCommand sh -c 'if nc -z -G 1 127.0.0.1 10808 2>/dev/null; then exec nc -X 5 -x 127.0.0.1:10808 203.0.113.20 22; else exec nc %h %p; fi'
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+    IPQoS none
+
+Host dev-box-tunnel
+    HostName 127.0.0.1
+    Port 6022
+    User devuser
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    ProxyCommand ssh -W %h:%p -o BatchMode=yes vps-jump
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    IPQoS none
+    Compression yes
+
+
+# --- Linux Dev Machine (~/.ssh/config for autossh reverse tunnel) ---
+Host tunnel-vps
+    HostName 198.51.100.10
+    Port 2222
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519_tunnel
+    IdentitiesOnly yes
+    # On Linux (OpenBSD netcat), use -w 1 for local port probe
+    ProxyCommand sh -c 'if nc -z -w 1 127.0.0.1 10808 2>/dev/null; then exec nc -X 5 -x 127.0.0.1:10808 203.0.113.20 22; else exec nc %h %p; fi'
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    TCPKeepAlive yes
+    ExitOnForwardFailure yes
+    StrictHostKeyChecking accept-new
+    BatchMode yes
+    IPQoS none
+    Compression yes
