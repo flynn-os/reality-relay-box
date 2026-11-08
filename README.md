@@ -2,16 +2,33 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-> **Dual-VPS (Rotatable Entry Relay + Fixed-Exit IP) VLESS + REALITY proxy suite — engineered for AI coding tools (Claude Code, OpenAI, etc.) that require a rock-solid, static egress IP.**
+> **Dual-VPS (Rotatable Entry Relay + Fixed-Exit IP) VLESS + REALITY anti-blocking proxy suite — engineered for AI coding tools (Claude Code, OpenAI, etc.) that require a rock-solid, static egress IP.**
 
-Running a single-VPS proxy (like the basic `reality-box`) for AI coding tools creates a painful dilemma:
+## 📌 Prerequisite: Relationship with [`surgeshi/reality-box`](https://github.com/surgeshi/reality-box)
+
+This repository is the **advanced high-availability & anti-blocking hardening companion** to [**`surgeshi/reality-box`**](https://github.com/surgeshi/reality-box). We recommend following this progression:
+
+1. **Starting from Scratch (Prerequisite Guide)**: If you are setting up a VPS proxy for the first time to use **Claude Code** (including buying a VPS, installing the `v2rayN` client, and configuring proxy environment variables for Claude Code), **start with [`surgeshi/reality-box`](https://github.com/surgeshi/reality-box) first**.
+2. **When Your IP Gets Blocked / Protecting Your Static Egress IP (Upgrade to This Repo)**: When running a single-VPS setup (`reality-box`) under heavy Claude Code or cross-border SSH usage, your VPS IP may eventually get blocked by the firewall. Replacing a blocked IP on a single VPS changes your egress IP — which frequently triggers Anthropic / OpenAI account risk controls. If you run into IP blocking (or want to prevent your clean egress IP from ever being exposed), upgrade to this **`reality-relay-box` Dual-VPS + 6-Layer Hardening Solution**.
+
+> [!IMPORTANT]
+> **⚠️ Critical Rule: You MUST Bind a "Static IP" to Your VPS!**
+> Whether you use a single VPS or this dual-VPS architecture, after creating your instance in the cloud console (e.g., AWS Lightsail *Networking → Create static IP*), you **MUST manually create and attach a Static Public IP** (mandatory for the **Fixed-Exit VPS**, and strongly recommended for the **Entry Relay VPS**):
+> - By default, cloud instances are assigned a **dynamic public IP** that **changes automatically whenever the VPS is stopped or rebooted** — immediately breaking your "static egress IP" for Claude Code (risking account bans) or disconnecting your client!
+> - On AWS Lightsail, Static IPs are **100% free** while attached to a running instance. Attaching a Static IP to your Entry Relay VPS also lets you rotate its IP in seconds directly from the console (detach old Static IP → attach new Static IP) without rebuilding the instance.
+
+---
+
+## Why Upgrade from a Single-VPS Setup?
+
+Running a single-VPS proxy (like the basic [`reality-box`](https://github.com/surgeshi/reality-box)) for AI coding tools creates a painful dilemma:
 1. **Account Ban Risk on Egress IP Changes**: Platforms like Anthropic (Claude Code) and OpenAI enforce strict risk controls when your egress IP changes frequently.
 2. **Entry IP Blocking**: When a single VPS acts as both entry and exit, any firewall block on the entry IP forces you to replace the server's IP — breaking your static egress IP.
 
 **`reality-relay-box`** solves both problems with a **Decoupled Dual-VPS Architecture (Entry Relay VPS + Fixed-Exit VPS)** combined with **6 production-proven anti-blocking hardening measures**:
-- **100% Static Egress IP Forever**: Your Fixed-Exit VPS never exposes its proxy port directly to the public internet. All outbound requests to Claude / OpenAI always originate from the exact same clean IP.
+- **100% Static Egress IP Forever**: Your Fixed-Exit VPS (bound to a **Static IP**) never exposes its proxy port directly to the public internet. All outbound requests to Claude / OpenAI always originate from the exact same clean Static IP.
 - **Hardened Against Active & Passive Probing**: Fixes the most common causes of REALITY IP blocks — including **ASN-mismatched SNI targets (e.g., using `www.cloudflare.com` on an AWS IP)**, **24/7 plaintext cross-border SSH tunnels**, and **fixed-interval client health-check beaconing**.
-- **1-Second Zero-Downtime Relay Rotation**: If you ever need to rotate your Entry Relay VPS IP, your Fixed-Exit VPS and client credentials remain untouched. Run `setup-relay.sh` on the new relay and `switch-relay-ip.sh <NEW_IP>` on your client.
+- **1-Second Zero-Downtime Relay Rotation**: If you ever need to rotate your Entry Relay VPS Static IP, your Fixed-Exit VPS and client credentials remain untouched. Run `setup-relay.sh` on the new relay and `switch-relay-ip.sh <NEW_IP>` on your client.
 
 ---
 
@@ -50,10 +67,10 @@ Running a single-VPS proxy (like the basic `reality-box`) for AI coding tools cr
 
 ## Quick Start
 
-### Step 1: Provision Two VPSs in the Same Region (e.g., AWS Lightsail Tokyo)
-1. Create two **Ubuntu 22.04 LTS** instances in the same region:
-   - **Fixed-Exit VPS**: public IP e.g. `203.0.113.20`, private VPC IP e.g. `172.26.2.20`.
-   - **Entry Relay VPS**: public IP e.g. `198.51.100.10`, private VPC IP e.g. `172.26.1.10`.
+### Step 1: Provision Two VPSs in the Same Region & Bind Static IPs (e.g., AWS Lightsail Tokyo)
+1. Create two **Ubuntu 22.04 LTS** instances in the same region and **attach a Static IP** (*Networking → Create static IP*) to them:
+   - **Fixed-Exit VPS**: **MUST bind a Static Public IP** (e.g. `203.0.113.20` — never rely on the default dynamic IP, which changes on reboot!), and note its private VPC IP (e.g. `172.26.2.20`).
+   - **Entry Relay VPS**: Bind a **Static Public IP** (e.g. `198.51.100.10` — persists across reboots and can be swapped in seconds from the console), and note its private VPC IP (e.g. `172.26.1.10`).
 2. In the **Entry Relay VPS** cloud firewall, open **`TCP 443`** (and optionally `TCP 2222` for emergency SSH fallback).
 
 ### Step 2: Set Up the Fixed-Exit VPS

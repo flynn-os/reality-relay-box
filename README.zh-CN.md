@@ -2,16 +2,33 @@
 
 [English](README.md) | **简体中文**
 
-> **双 VPS（动态入口中转 + 固定出口 IP）VLESS + REALITY 高抗封锁代理套件 —— 专为 Claude Code / OpenAI 等对出口 IP 变动高度敏感的 AI Coding 工具打造。**
+> **双 VPS（动态入口中转 + 固定出口 IP）VLESS + REALITY 进阶抗封锁加固套件 —— 专为 Claude Code / OpenAI 等对出口 IP 变动高度敏感的 AI Coding 工具打造。**
 
-在使用单台 VPS 搭建代理（如基础版 `reality-box`）时，常面临一个两难困境：
-1. **AI 平台风控封号**：Anthropic（Claude Code）、OpenAI 等平台对账号的出口 IP 纯净度与稳定性极为敏感，频繁更换出口 VPS 极易触发风控封号；
+## 📌 前置必读：与 [`surgeshi/reality-box`](https://github.com/surgeshi/reality-box) 的关系
+
+本项目是 [**`surgeshi/reality-box`**](https://github.com/surgeshi/reality-box) 的**进阶高可用与抗封锁加固版**，建议搭配阅读与使用：
+
+1. **新手从零搭建（前置教程）**：如果你刚开始准备购买 VPS、从零配置客户端（v2rayN）以使用 **Claude Code**，请**先阅读并参照 [`surgeshi/reality-box`](https://github.com/surgeshi/reality-box)** 完成基础入门了解。
+2. **遇到 IP 被墙 / 需要保住固定出口 IP（平滑升级本方案）**：单机版 `reality-box` 在高强度使用 Claude Code 或跨国 SSH 时，可能会遇到 **VPS 的 IP 被防火墙阻断（被墙）** 的情况。一旦换 IP，不仅折腾，还会因为出口 IP 频繁变动触发 Anthropic / OpenAI 的风控封号。此时即可直接切换到本项目的 **“双机解耦 + 6 大抗封锁加固方案”**。
+
+> [!IMPORTANT]
+> **⚠️ 核心铁律：VPS 必须手动绑定“静态 IP（Static IP）”！**
+> 无论你使用单机还是本项目的双机方案，在云厂商控制台（如 AWS Lightsail 的 `Networking` → `Create static IP`）创建 VPS 后，**必须第一时间手动申请并绑定“静态公网 IP（Static IP）”**（尤其是**固定出口 VPS**，建议入口 VPS 也绑定）：
+> - 云服务器默认分配的公网 IP 是**动态 IP**，一旦实例关机重启或宿主维护，公网 IP 就会自动改变，直接导致 Claude Code 出口 IP 突变触发封号，或者客户端连接中断！
+> - 在 AWS Lightsail 中，绑定在运行中实例上的 Static IP 是**完全免费**的；且对于入口中转机而言，绑定 Static IP 后如果未来想换 IP，只需在控制台解绑旧静态 IP、重新创建一个新静态 IP 即可，无需重装机器。
+
+---
+
+## 为什么需要这套进阶加固方案？
+
+在使用单台 VPS 搭建代理（如基础版 [`reality-box`](https://github.com/surgeshi/reality-box)）时，常面临一个两难困境：
+1. **AI 平台风控封号**：Anthropic（Claude Code）、OpenAI 等平台对账号的出口 IP 纯净度与稳定性极为敏感，频繁更换出口 VPS 的 IP 极易触发风控封号；
 2. **单机入口易被防火墙阻断**：如果只用一台 VPS，一旦该机器的 IP 因特征暴露被防火墙阻断，你就不得不更换 VPS 的 IP —— 从而破坏“固定出口 IP”的前提。
 
 本项目通过 **“入口中转（Relay VPS）+ 固定出口（Exit VPS）”双机解耦架构** 结合 **6 项深度抗封锁加固**，彻底解决这一痛点：
-- **出口 IP 永久固定**：固定出口 VPS 从不直接暴露给客户端，所有访问 Claude / OpenAI 的流量永远从同一个干净的静态 IP 出站；
+- **出口 IP 永久固定**：固定出口 VPS 绑定静态 IP 且从不直接暴露给客户端，所有访问 Claude / OpenAI 的流量永远从同一个干净的静态 IP 出站；
 - **入口抗封锁深度加固**：修复了常规 REALITY 部署中最常踩坑的 **伪装域名 ASN 冲突（如误用 Cloudflare 导致空 SNI 探测泄露证书）**、**跨墙明文 SSH 隧道多端口关联**、**客户端固定频率机械心跳（Beaconing）** 等致命破绽；
-- **入口随时无感轮换**：万一未来入口 VPS 需要更换 IP，只需在入口机跑一条命令、客户端执行一行 `switch-relay-ip.sh`，**1 秒内完成热切换，出口 VPS 与所有密钥/UUID 无需任何改动**。
+- **入口随时无感轮换**：万一未来入口 VPS 需要更换静态 IP，只需在入口机跑一条命令、客户端执行一行 `switch-relay-ip.sh`，**1 秒内完成热切换，出口 VPS 与所有密钥/UUID 无需任何改动**。
 
 ---
 
@@ -50,12 +67,12 @@
 
 ---
 
-## 1. 准备两台同区域 VPS（以 AWS Lightsail 为例）
+## 1. 准备两台同区域 VPS 并绑定静态 IP（以 AWS Lightsail 为例）
 
 1. 登录 AWS Lightsail 控制台：<https://lightsail.aws.amazon.com/>
 2. 在**同一个区域**（例如东京 `ap-northeast-1`）创建两台 **Ubuntu 22.04 LTS** 实例（$5/月套餐即可）：
-   - **实例 A（固定出口机 Exit VPS）**：绑定一个固定公网 IP（假设为 `203.0.113.20`），记下它的**私网 IP**（如 `172.26.2.20`）。
-   - **实例 B（入口中转机 Relay VPS）**：分配公网 IP（假设为 `198.51.100.10`），记下它的**私网 IP**（如 `172.26.1.10`）。
+   - **实例 A（固定出口机 Exit VPS）**：**必须进入 `Networking` 标签页点击 `Create static IP` 绑定一个静态公网 IP**（假设为 `203.0.113.20`，切勿使用默认的动态公网 IP，否则重启机器后出口 IP 会变！），并记下它的**私网 IP**（如 `172.26.2.20`）。
+   - **实例 B（入口中转机 Relay VPS）**：同样建议绑定一个**静态公网 IP**（假设为 `198.51.100.10`，方便重启不变且日后可随时在控制台一键解绑换新 IP），并记下它的**私网 IP**（如 `172.26.1.10`）。
 3. **云防火墙放行规则（Networking → IPv4 Firewall）**：
    - **入口中转机（Relay VPS）**：放行自定义 `TCP 443`（以及可选的应急 SSH 转发端口 `TCP 2222`）。
    - **固定出口机（Exit VPS）**：同账号同区域的 Lightsail 实例默认在同一个 VPC 子网（`172.26.0.0/16`）内互通，无需对公网暴露 `8443`；如需跨网段调试可放行 `TCP 443`。
