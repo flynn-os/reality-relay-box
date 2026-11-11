@@ -13,13 +13,16 @@
 #     be rotated anytime without touching your Exit VPS or credentials.
 #
 # Key Anti-Blocking Hardening Built In:
-#   1. Enables TCP BBR + FQ congestion control automatically.
-#   2. Defaults to an ASN-aligned camouflage target (d1.awsstatic.com for AWS
+#   1. Enables TCP BBR + FQ congestion control and TCP MTU probing automatically.
+#   2. Configures persistent bidirectional TCP MSS clamping (<=1280 IPv4 / <=1220
+#      IPv6, ceiling-only) across SSH + REALITY ports so 4G/5G mobile hotspots
+#      (464XLAT/CLAT) never stall on AWS Jumbo Frame (MTU 9001) + Chrome PQ ClientHellos.
+#   3. Defaults to an ASN-aligned camouflage target (d1.awsstatic.com for AWS
 #      regions, TLS 1.3 + HTTP/2) so passive DPI sees 100% ASN consistency and
 #      active empty-SNI probes never leak a mismatched CDN certificate.
-#   3. Listens on both 443 and an internal relay port (8443) with xver=0 and
+#   4. Listens on both 443 and an internal relay port (8443) with xver=0 and
 #      production-safe warning log level.
-#   4. Generates all credentials (UUID, X25519 key pair, ShortID) locally on
+#   5. Generates all credentials (UUID, X25519 key pair, ShortID) locally on
 #      run and prints a ready-to-import vless:// share link.
 #
 # Usage:
@@ -31,6 +34,7 @@
 #   INTERNAL_PORT    VPC internal listening port        (default: 8443)
 #   DEST             REALITY camouflage target host     (default: d1.awsstatic.com)
 #   SNI              TLS SNI shown to the firewall      (default: same as DEST)
+#   TCP_MSS          IPv4 TCP MSS ceiling for hotspots  (default: 1280)
 #   TAG              Client profile name                (default: Reality-Relay-<ip>)
 # -------------------------------------------------------------------------
 
@@ -46,6 +50,8 @@ PORT="${PORT:-443}"
 INTERNAL_PORT="${INTERNAL_PORT:-8443}"
 DEST="${DEST:-d1.awsstatic.com}"
 SNI="${SNI:-$DEST}"
+TCP_MSS="${TCP_MSS:-1280}"
+TCP_MSS6="${TCP_MSS6:-1220}"
 CONFIG_DIR="/usr/local/etc/xray"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 CLIENT_FILE="/root/reality-client.txt"
@@ -53,13 +59,127 @@ CLIENT_FILE="/root/reality-client.txt"
 [ "$(id -u)" -eq 0 ] || die "Please run as root: sudo bash $0"
 command -v apt >/dev/null 2>&1 || die "This script targets Debian/Ubuntu (apt not found)."
 
-# ----- 1. Enable TCP BBR + FQ ------------------------------------------------
-info "Enabling TCP BBR + FQ congestion control..."
-if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-  printf "\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n" >> /etc/sysctl.conf
+# ----- 1. Enable TCP BBR + FQ + PMTUD Blackhole Probing ----------------------
+info "Enabling TCP BBR + FQ congestion control and TCP MTU probing..."
+grep -q "^net.core.default_qdisc=" /etc/sysctl.conf 2>/dev/null \
+  || printf "\nnet.core.default_qdisc=fq\n" >> /etc/sysctl.conf
+grep -q "^net.ipv4.tcp_congestion_control=" /etc/sysctl.conf 2>/dev/null \
+  || printf "net.ipv4.tcp_congestion_control=bbr\n" >> /etc/sysctl.conf
+if ! grep -q "^net.ipv4.tcp_mtu_probing=" /etc/sysctl.conf 2>/dev/null; then
+  printf "net.ipv4.tcp_mtu_probing=1\n" >> /etc/sysctl.conf
+else
+  sed -i 's/^net\.ipv4\.tcp_mtu_probing=.*/net.ipv4.tcp_mtu_probing=1/' /etc/sysctl.conf
 fi
-sysctl -p >/dev/null 2>&1 || true
-ok "TCP congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
+ok "TCP congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown), tcp_mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unknown)"
+
+# ----- 1b. Configure Bidirectional TCP MSS Clamping (Hotspot/464XLAT Safe) ---
+MSS_PORTS="$(printf '%s\n' "22" "$PORT" "$INTERNAL_PORT" | awk '!seen[$0]++' | paste -sd, -)"
+info "Configuring zero-downtime bidirectional TCP MSS ceiling (IPv4<=${TCP_MSS}, IPv6<=${TCP_MSS6} on ports ${MSS_PORTS})..."
+install -d -m 0755 /usr/local/libexec
+cat > /usr/local/libexec/reality-tcp-mss <<'MSS_EOF'
+#!/bin/sh
+# Managed by reality-relay-box: bidirectional TCP MSS ceiling for mobile hotspot / 464XLAT / tunnel paths.
+# Clamps only SYN / SYN-ACK packets whose MSS exceeds the ceiling (never raises smaller MSS).
+# Existing established TCP connections are completely untouched.
+set -eu
+
+IPTABLES="${IPTABLES:-/usr/sbin/iptables}"
+IP6TABLES="${IP6TABLES:-/usr/sbin/ip6tables}"
+PORTS="${PORTS:-22,443,8443}"
+MSS4="${MSS4:-1280}"
+MSS6="${MSS6:-1220}"
+MIN4=$((MSS4 + 1))
+MIN6=$((MSS6 + 1))
+
+sync_rule() {
+    bin="$1"; chain="$2"; port_flag="$3"; tag="$4"; mss="$5"; min_mss="$6"
+    [ -x "$bin" ] || return 0
+    if "$bin" -w 5 -t mangle -C "$chain" -p tcp -m multiport "$port_flag" "$PORTS" \
+        --tcp-flags SYN,RST SYN -m tcpmss --mss "${min_mss}:65535" \
+        -m comment --comment "$tag" -j TCPMSS --set-mss "$mss" 2>/dev/null; then
+        return 0
+    fi
+    "$bin" -w 5 -t mangle -I "$chain" 1 -p tcp -m multiport "$port_flag" "$PORTS" \
+        --tcp-flags SYN,RST SYN -m tcpmss --mss "${min_mss}:65535" \
+        -m comment --comment "$tag" -j TCPMSS --set-mss "$mss"
+    "$bin" -w 5 -t mangle -S "$chain" 2>/dev/null \
+        | grep -- "-A ${chain} " \
+        | grep -- "--comment ${tag}" \
+        | tail -n +2 \
+        | sed "s/^-A ${chain} //" \
+        | while IFS= read -r spec; do
+            # shellcheck disable=SC2086
+            "$bin" -w 5 -t mangle -D "$chain" $spec 2>/dev/null || true
+        done
+}
+
+remove_by_comment() {
+    bin="$1"; chain="$2"; tag="$3"
+    [ -x "$bin" ] || return 0
+    "$bin" -w 5 -t mangle -S "$chain" 2>/dev/null \
+        | grep -- "-A ${chain} " \
+        | grep -- "--comment ${tag}" \
+        | sed "s/^-A ${chain} //" \
+        | while IFS= read -r spec; do
+            # shellcheck disable=SC2086
+            "$bin" -w 5 -t mangle -D "$chain" $spec 2>/dev/null || true
+        done
+}
+
+case "${1:-status}" in
+    apply)
+        sync_rule "$IPTABLES" INPUT --dports reality-tcp-mss-in "$MSS4" "$MIN4"
+        sync_rule "$IPTABLES" OUTPUT --sports reality-tcp-mss-out "$MSS4" "$MIN4"
+        sync_rule "$IP6TABLES" INPUT --dports reality-tcp-mss-in "$MSS6" "$MIN6" || true
+        sync_rule "$IP6TABLES" OUTPUT --sports reality-tcp-mss-out "$MSS6" "$MIN6" || true
+        ;;
+    remove)
+        remove_by_comment "$IPTABLES" OUTPUT reality-tcp-mss-out
+        remove_by_comment "$IPTABLES" INPUT reality-tcp-mss-in
+        remove_by_comment "$IP6TABLES" OUTPUT reality-tcp-mss-out
+        remove_by_comment "$IP6TABLES" INPUT reality-tcp-mss-in
+        ;;
+    status)
+        "$IPTABLES" -w 5 -t mangle -S | grep "reality-tcp-mss-"
+        ;;
+    *)
+        printf 'Usage: %s [apply|remove|status]\n' "$0" >&2
+        exit 2
+        ;;
+esac
+MSS_EOF
+chmod 0755 /usr/local/libexec/reality-tcp-mss
+
+cat > /etc/systemd/system/reality-tcp-mss.service <<UNIT_EOF
+[Unit]
+Description=reality-relay-box bidirectional TCP MSS clamping for hotspot/tunnel compatibility
+DefaultDependencies=no
+After=local-fs.target ufw.service nftables.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+Environment="PORTS=${MSS_PORTS}" "MSS4=${TCP_MSS}" "MSS6=${TCP_MSS6}"
+ExecStart=/usr/local/libexec/reality-tcp-mss apply
+ExecReload=/usr/local/libexec/reality-tcp-mss apply
+ExecStop=/usr/local/libexec/reality-tcp-mss remove
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+systemctl daemon-reload
+systemctl enable --now reality-tcp-mss.service >/dev/null
+systemctl reload-or-restart reality-tcp-mss.service >/dev/null
+if systemctl is-enabled --quiet claudemagic-proxy-mss.service 2>/dev/null || systemctl is-active --quiet claudemagic-proxy-mss.service 2>/dev/null; then
+  systemctl stop claudemagic-proxy-mss.service >/dev/null 2>&1 || true
+  systemctl disable claudemagic-proxy-mss.service >/dev/null 2>&1 || true
+fi
+ok "Bidirectional TCP MSS ceiling active on ports ${MSS_PORTS} (IPv4<=${TCP_MSS}, IPv6<=${TCP_MSS6})."
 
 # ----- 2. Install dependencies & Xray-core -----------------------------------
 info "Installing dependencies (curl, openssl, qrencode)..."

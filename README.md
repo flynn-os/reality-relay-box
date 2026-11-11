@@ -9,7 +9,7 @@
 This repository is the **advanced high-availability & anti-blocking hardening companion** to [**`surgeshi/reality-box`**](https://github.com/surgeshi/reality-box). We recommend following this progression:
 
 1. **Starting from Scratch (Prerequisite Guide)**: If you are setting up a VPS proxy for the first time to use **Claude Code** (including buying a VPS, installing the `v2rayN` client, and configuring proxy environment variables for Claude Code), **start with [`surgeshi/reality-box`](https://github.com/surgeshi/reality-box) first**.
-2. **When Your IP Gets Blocked / Protecting Your Static Egress IP (Upgrade to This Repo)**: When running a single-VPS setup (`reality-box`) under heavy Claude Code or cross-border SSH usage, your VPS IP may eventually get blocked by the firewall. Replacing a blocked IP on a single VPS changes your egress IP — which frequently triggers Anthropic / OpenAI account risk controls. If you run into IP blocking (or want to prevent your clean egress IP from ever being exposed), upgrade to this **`reality-relay-box` Dual-VPS + 6-Layer Hardening Solution**.
+2. **When Your IP Gets Blocked / Protecting Your Static Egress IP (Upgrade to This Repo)**: When running a single-VPS setup (`reality-box`) under heavy Claude Code or cross-border SSH usage, your VPS IP may eventually get blocked by the firewall. Replacing a blocked IP on a single VPS changes your egress IP — which frequently triggers Anthropic / OpenAI account risk controls. If you run into IP blocking (or want to prevent your clean egress IP from ever being exposed), upgrade to this **`reality-relay-box` Dual-VPS + 7-Layer Hardening Solution**.
 
 > [!IMPORTANT]
 > **⚠️ Critical Rule: You MUST Bind a "Static IP" to Your VPS!**
@@ -25,7 +25,7 @@ Running a single-VPS proxy (like the basic [`reality-box`](https://github.com/su
 1. **Account Ban Risk on Egress IP Changes**: Platforms like Anthropic (Claude Code) and OpenAI enforce strict risk controls when your egress IP changes frequently.
 2. **Entry IP Blocking**: When a single VPS acts as both entry and exit, any firewall block on the entry IP forces you to replace the server's IP — breaking your static egress IP.
 
-**`reality-relay-box`** solves both problems with a **Decoupled Dual-VPS Architecture (Entry Relay VPS + Fixed-Exit VPS)** combined with **6 production-proven anti-blocking hardening measures**:
+**`reality-relay-box`** solves both problems with a **Decoupled Dual-VPS Architecture (Entry Relay VPS + Fixed-Exit VPS)** combined with **7 production-proven anti-blocking & network-compatibility hardening measures**:
 - **100% Static Egress IP Forever**: Your Fixed-Exit VPS (bound to a **Static IP**) never exposes its proxy port directly to the public internet. All outbound requests to Claude / OpenAI always originate from the exact same clean Static IP.
 - **Hardened Against Active & Passive Probing**: Fixes the most common causes of REALITY IP blocks — including **ASN-mismatched SNI targets (e.g., using `www.cloudflare.com` on an AWS IP)**, **24/7 plaintext cross-border SSH tunnels**, and **fixed-interval client health-check beaconing**.
 - **1-Second Zero-Downtime Relay Rotation**: If you ever need to rotate your Entry Relay VPS Static IP, your Fixed-Exit VPS and client credentials remain untouched. Run `setup-relay.sh` on the new relay and `switch-relay-ip.sh <NEW_IP>` on your client.
@@ -39,7 +39,7 @@ Running a single-VPS proxy (like the basic [`reality-box`](https://github.com/su
    │  1) VLESS + REALITY (SNI: d1.awsstatic.com, Chrome FP, No Fragment)
    │  2) Cross-border SSH / autossh encapsulated inside 10808 proxy (Zero raw SSH exposure)
    ▼
-[ Entry Relay VPS (e.g. 198.51.100.10) ]   <-- Exposes :443, TCP BBR+FQ enabled
+[ Entry Relay VPS (e.g. 198.51.100.10) ]   <-- Exposes :443, BBR+FQ + bidirectional MSS<=1280
    │  HAProxy (SNI routing + AWS VPC private network -> 172.26.2.20:8443, RTT ~0.15ms)
    ▼
 [ Fixed-Exit VPS (e.g. 203.0.113.20) ]     <-- Static Egress IP, invisible to scanners
@@ -52,9 +52,9 @@ Running a single-VPS proxy (like the basic [`reality-box`](https://github.com/su
 
 ---
 
-## 6 Built-In Anti-Blocking Hardening Measures
+## 7 Built-In Anti-Blocking & Network Hardening Measures
 
-| # | Common Misconfiguration (Why Entry IPs Get Blocked) | How `reality-relay-box` Fixes It |
+| # | Common Misconfiguration (Why Entry IPs Get Blocked or Hotspots Stall) | How `reality-relay-box` Fixes It |
 | :--- | :--- | :--- |
 | **1. SNI ↔ ASN Conflict** | Setting `SNI`/`dest` to `www.cloudflare.com` on an AWS VPS. Passive DPI immediately flags `SNI=www.cloudflare.com` (AS13335) going to an AWS IP (AS16509). Worse, an empty-SNI active probe against the AWS IP returns Cloudflare's official TLS certificate. | Defaults to **`d1.awsstatic.com`** (AWS official static CDN, AS16509, TLS 1.3 + HTTP/2). Passive DPI sees 100% ASN consistency; empty-SNI probes are rejected just like a real CloudFront edge, and SNI probes return an authentic `Amazon RSA 2048 M04` certificate. |
 | **2. Raw Cross-Border SSH Tunnels** | Running 24/7 `autossh` reverse tunnels or jump hosts directly to the Entry VPS on `:22` or `:2222` alongside `:443`. Exposes `SSH-2.0-OpenSSH` banners and keepalive timing from the same client IP. | [`client/ssh/ssh-config.example`](client/ssh/ssh-config.example) routes SSH through the local `127.0.0.1:10808` REALITY SOCKS5 proxy, with automatic fallback to `:2222` only if the local proxy is down. Result: **zero raw cross-border SSH packets** during normal operation. |
@@ -62,6 +62,7 @@ Running a single-VPS proxy (like the basic [`reality-box`](https://github.com/su
 | **4. Broken `send-proxy-v2` / `xver` Pairing** | Setting `realitySettings.xver: 2` (which actually sends a PROXY header *outbound* to the camouflage site `dest`) causes immediate connection resets. | Enforces `realitySettings.xver: 0` with HAProxy SNI-based TCP passthrough (`req_ssl_hello_type 1`). |
 | **5. 10-Second Client Beaconing** | Watchdog scripts polling `gstatic.com` every 10 seconds emit 8,640 fixed-interval TLS handshakes per day across the firewall. | [`client/macos/v2ray-proxy-watchdog.sh`](client/macos/v2ray-proxy-watchdog.sh) checks local macOS `networksetup` state first (zero network traffic) and only probes outbound when the system proxy was actually turned off. |
 | **6. Artificial TLS Hello Fragmentation** | Enabling `tlshello` fragmentation (`finalmask` 50–100B) on REALITY creates an obvious non-browser packet signature. | Automatically strips `finalmask` / disables `EnableFragment`, enables **TCP BBR + FQ** on both servers, and sets Xray logs to `warning`. |
+| **7. Mobile Hotspot / 464XLAT MTU Blackholes (`-1ms` Timeout)** | AWS Nitro NICs default to `mtu 9001` (Jumbo Frames) while modern Chrome TLS 1.3 fingerprints embed Post-Quantum `X25519MLKEM768` (`~1,850B` `ClientHello`). Over 4G/5G hotspots (IPv6 + 464XLAT/CLAT with effective MTU `1280–1380` and blocked ICMP `Frag Needed`), `1500B` (`DF=1`) segments are silently dropped — causing `v2rayN` `-1ms` timeouts and stalled SSH `KEX_ECDH_REPLY`. | Installs persistent `reality-tcp-mss.service` on both Relay and Exit VPSs to apply ceiling-only bidirectional `SYN`/`SYN-ACK` MSS clamping (`<=1280` IPv4 / `<=1220` IPv6) plus `net.ipv4.tcp_mtu_probing=1` with zero disruption to live sessions. |
 
 ---
 

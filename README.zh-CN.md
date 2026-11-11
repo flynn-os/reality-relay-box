@@ -9,7 +9,7 @@
 本项目是 [**`surgeshi/reality-box`**](https://github.com/surgeshi/reality-box) 的**进阶高可用与抗封锁加固版**，建议搭配阅读与使用：
 
 1. **新手从零搭建（前置教程）**：如果你刚开始准备购买 VPS、从零配置客户端（v2rayN）以使用 **Claude Code**，请**先阅读并参照 [`surgeshi/reality-box`](https://github.com/surgeshi/reality-box)** 完成基础入门了解。
-2. **遇到 IP 被墙 / 需要保住固定出口 IP（平滑升级本方案）**：单机版 `reality-box` 在高强度使用 Claude Code 或跨国 SSH 时，可能会遇到 **VPS 的 IP 被防火墙阻断（被墙）** 的情况。一旦换 IP，不仅折腾，还会因为出口 IP 频繁变动触发 Anthropic / OpenAI 的风控封号。此时即可直接切换到本项目的 **“双机解耦 + 6 大抗封锁加固方案”**。
+2. **遇到 IP 被墙 / 需要保住固定出口 IP（平滑升级本方案）**：单机版 `reality-box` 在高强度使用 Claude Code 或跨国 SSH 时，可能会遇到 **VPS 的 IP 被防火墙阻断（被墙）** 的情况。一旦换 IP，不仅折腾，还会因为出口 IP 频繁变动触发 Anthropic / OpenAI 的风控封号。此时即可直接切换到本项目的 **“双机解耦 + 7 大抗封锁与全网络加固方案”**。
 
 > [!IMPORTANT]
 > **⚠️ 核心铁律：VPS 必须手动绑定“静态 IP（Static IP）”！**
@@ -25,7 +25,7 @@
 1. **AI 平台风控封号**：Anthropic（Claude Code）、OpenAI 等平台对账号的出口 IP 纯净度与稳定性极为敏感，频繁更换出口 VPS 的 IP 极易触发风控封号；
 2. **单机入口易被防火墙阻断**：如果只用一台 VPS，一旦该机器的 IP 因特征暴露被防火墙阻断，你就不得不更换 VPS 的 IP —— 从而破坏“固定出口 IP”的前提。
 
-本项目通过 **“入口中转（Relay VPS）+ 固定出口（Exit VPS）”双机解耦架构** 结合 **6 项深度抗封锁加固**，彻底解决这一痛点：
+本项目通过 **“入口中转（Relay VPS）+ 固定出口（Exit VPS）”双机解耦架构** 结合 **7 项深度抗封锁与网络兼容性加固**，彻底解决这一痛点：
 - **出口 IP 永久固定**：固定出口 VPS 绑定静态 IP 且从不直接暴露给客户端，所有访问 Claude / OpenAI 的流量永远从同一个干净的静态 IP 出站；
 - **入口抗封锁深度加固**：修复了常规 REALITY 部署中最常踩坑的 **伪装域名 ASN 冲突（如误用 Cloudflare 导致空 SNI 探测泄露证书）**、**跨墙明文 SSH 隧道多端口关联**、**客户端固定频率机械心跳（Beaconing）** 等致命破绽；
 - **入口随时无感轮换**：万一未来入口 VPS 需要更换静态 IP，只需在入口机跑一条命令、客户端执行一行 `switch-relay-ip.sh`，**1 秒内完成热切换，出口 VPS 与所有密钥/UUID 无需任何改动**。
@@ -39,7 +39,7 @@
    │  1) VLESS + REALITY (SNI: d1.awsstatic.com, Chrome 指纹, 零分片)
    │  2) 跨墙 SSH / autossh 自动封装进 10808 隧道内部 (公网零 SSH 暴露)
    ▼
-[ 入口中转 VPS (Relay, 如 198.51.100.10) ]  <-- 仅暴露 :443, 启用 BBR+FQ
+[ 入口中转 VPS (Relay, 如 198.51.100.10) ]  <-- 仅暴露 :443, 启用 BBR+FQ + 双向 MSS<=1280 热点防卡死
    │  HAProxy (SNI 分流 + AWS 同机房 VPC 内网直连 172.26.2.20:8443, RTT ~0.15ms)
    ▼
 [ 固定出口 VPS (Exit, 如 203.0.113.20) ]    <-- 出口 IP 永久不变, 对外隐身
@@ -52,9 +52,9 @@
 
 ---
 
-## 为什么传统配法会导致入口 IP 频繁被封？（6 大加固设计）
+## 为什么传统配法会导致入口 IP 频繁被封或手机热点断连？（7 大加固设计）
 
-本项目针对真实生产环境中定位出的 **6 大高频被封根因** 做了默认固化：
+本项目针对真实生产环境中定位出的 **7 大高频被封与跨网黑洞根因** 做了默认固化：
 
 | 根因编号 | 传统配法的致命破绽 | 本项目的内置加固方案 |
 | :--- | :--- | :--- |
@@ -64,6 +64,7 @@
 | **4. 误配 `send-proxy-v2` 与 `xver`** | 在 HAProxy 加 `send-proxy-v2` 同时把 Xray `realitySettings.xver` 设为 `2`（`xver` 实为向伪装目标网站发 PROXY 头），导致目标网站直接重置连接、代理瘫痪。 | 严格保持 `realitySettings.xver: 0` 原生透传，并在 HAProxy 层启用 `req_ssl_hello_type 1` 与 SNI 识别分流，兼顾零断流切换与稳定性。 |
 | **5. 客户端 10 秒机械心跳（Beaconing）** | 守护脚本每 10 秒通过代理 `curl` 一次外网（每天发出 8,640 次严格等间隔、同包长的 TLS 握手），形成明显的机器信标特征。 | `client/macos/v2ray-proxy-watchdog.sh` 采用 **Zero-Beaconing 设计**：每 10 秒仅做纯本地系统设置检查（零网络流量），仅当系统代理被篡改关闭时才做一次外网检查并恢复。 |
 | **6. 首包固定分片与拥塞重传** | 对 REALITY 开启 `finalmask`（`tlshello` 50-100 字节分片），人为制造非浏览器特征；服务端默认 `cubic` 拥塞控制。 | 自动关闭客户端 `EnableFragment` / `finalmask`，服务端一键启用 **TCP BBR + FQ** 并将 Xray 日志设为 `warning`。 |
+| **7. 手机热点 / 464XLAT 路径 MTU 黑洞（`-1ms` 卡死）** | AWS 实例网卡默认 `mtu 9001`（Jumbo Frame），而现代 Chrome 指纹携带后量子 `X25519MLKEM768` 使首个 `ClientHello` 达 `~1,850B`。切到 4G/5G 手机热点（IPv6 + 464XLAT 实际 MTU 常缩水至 `1280~1380` 且丢弃 ICMP 分片差错）时，`1500B`（`DF=1`）首包被静默丢弃，导致 `v2rayN` 测速 `-1ms`、SSH 卡在 `KEX_ECDH_REPLY`。 | 中转机与出口机默认安装持久化 `reality-tcp-mss.service`，对 `SYN`/`SYN-ACK` 做**双向只削峰不拔高**的 TCP MSS 钳制（IPv4 `<=1280` / IPv6 `<=1220`）并开启 `net.ipv4.tcp_mtu_probing=1`，Wi-Fi 与手机热点无缝秒连且热更新零断流。 |
 
 ---
 
@@ -90,7 +91,7 @@ sudo RELAY_PUBLIC_IP=198.51.100.10 bash setup-exit.sh
 ```
 
 脚本会自动完成：
-1. 开启内核 `BBR + FQ`；
+1. 开启内核 `BBR + FQ` 与 `tcp_mtu_probing=1`，并配置持久化双向 TCP MSS 钳制（`<=1280`，兼容 4G/5G 手机热点与 464XLAT）；
 2. 安装 Xray-core，生成全新的 UUID、X25519 密钥对和 ShortID；
 3. 配置 `:443` 与内网 `:8443` 双入站（默认伪装目标 `d1.awsstatic.com:443`）；
 4. 打印出下一步在入口机上执行的命令，以及客户端 `vless://` 导入链接（同时保存在 `/root/reality-client.txt`）。
@@ -104,6 +105,7 @@ sudo RELAY_PUBLIC_IP=198.51.100.10 bash setup-exit.sh
 | `SNI` | 同 `DEST` | 客户端握手携带的 TLS SNI |
 | `PORT` | `443` | 外部端口 |
 | `INTERNAL_PORT` | `8443` | 供同区域入口机通过 VPC 内网连接的端口 |
+| `TCP_MSS` | `1280` | IPv4 双向 TCP MSS 削峰上限（解决手机热点/464XLAT 大包黑洞） |
 
 ---
 
@@ -118,7 +120,7 @@ sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8443 SNI=d1.awsstatic.com bash setup-relay.
 ```
 
 脚本会自动完成：
-1. 开启内核 `BBR + FQ`；
+1. 开启内核 `BBR + FQ` 与 `tcp_mtu_probing=1`，并在 `22 / 443 / 2222` 端口启用持久化双向 `TCP MSS <= 1280` 钳制；
 2. 安装 HAProxy 并验证到出口机 `172.26.2.20:8443` 的内网连通性；
 3. 配置 `:443` SNI 分流转发至出口机内网 `:8443`，以及 `:2222` 应急转发至出口机 `:22`。
 

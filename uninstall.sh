@@ -21,4 +21,13 @@ if systemctl is-active --quiet haproxy 2>/dev/null; then
   echo "[+] HAProxy stopped."
 fi
 
+if [ -f /etc/systemd/system/reality-tcp-mss.service ] || [ -x /usr/local/libexec/reality-tcp-mss ]; then
+  echo "[*] Removing reality-tcp-mss rules and systemd unit..."
+  systemctl stop reality-tcp-mss.service 2>/dev/null || /usr/local/libexec/reality-tcp-mss remove 2>/dev/null || true
+  systemctl disable reality-tcp-mss.service 2>/dev/null || true
+  rm -f /etc/systemd/system/reality-tcp-mss.service /usr/local/libexec/reality-tcp-mss
+  systemctl daemon-reload 2>/dev/null || true
+  echo "[+] TCP MSS clamping rules removed."
+fi
+
 echo "[+] Done."
