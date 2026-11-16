@@ -159,8 +159,8 @@ sudo RELAY_PUBLIC_IP=198.51.100.10 bash setup-exit.sh
 - [`client/macos/v2ray-keepalive.sh`](client/macos/v2ray-keepalive.sh)：当 `v2rayN` 意外退出或 `10808` 无监听时自动拉起；
 - [`client/macos/v2ray-proxy-watchdog.sh`](client/macos/v2ray-proxy-watchdog.sh)：每 10 秒做纯本地 `networksetup` 检查（0 网络流量，零跨墙心跳），一旦系统代理被其他软件清除或因进程异常关闭，**无条件将其锁定回 `127.0.0.1:10808`**（失败关闭，杜绝浏览器与桌面应用静默直连泄漏；如需临时手动切其他代理，执行 `touch ~/.local/state/v2ray-proxy-watchdog.pause` 暂停，`rm` 该文件即恢复）。
 
-### 5.2 Linux 开发机防断流守护（`client/linux/`）
-- [`client/linux/v2rayn-keepalive.sh`](client/linux/v2rayn-keepalive.sh)：基于本地内核 `ss -tlnH sport = :10808` 检测（零探测流量），内置 **活跃 AI 会话保护**——检测到活跃 Claude Code 会话时推迟破坏性重启，防止长任务中途 `ECONNRESET`。
+### 5.2 Linux 开发机防断流 + 失败关闭系统代理守护（`client/linux/`）
+- [`client/linux/v2rayn-keepalive.sh`](client/linux/v2rayn-keepalive.sh)：基于本地内核 `ss -tlnH sport = :10808` 检测（零探测流量），内置 **活跃 AI 会话保护**（检测到活跃 Claude Code 会话时推迟破坏性重启，防止长任务中途 `ECONNRESET`）；同时在每次循环中以零网络流量将 GNOME `gsettings` 系统代理失败关闭锁定在 `127.0.0.1:10808`（保留自定义 `ignore-hosts`，同样支持通过 `~/.local/state/v2ray-proxy-watchdog.pause` 手动暂停）。
 
 ### 5.3 零公网暴露 SSH 跳板、VPC 级联与 `autossh` 反向隧道（`client/ssh/ssh-config.example`）
 按照 [`client/ssh/ssh-config.example`](client/ssh/ssh-config.example) 配置 `~/.ssh/config` 后，即可在第 1 节云防火墙彻底关闭公网 `22`/`2222`/`443(出口)`：

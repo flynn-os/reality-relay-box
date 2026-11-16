@@ -155,8 +155,8 @@ This configures `BBR + FQ`, `tcp_mtu_probing=1`, bidirectional `reality-tcp-mss`
 - [`client/macos/v2ray-keepalive.sh`](client/macos/v2ray-keepalive.sh): Relaunches `v2rayN` if the GUI exits or `10808` stops listening.
 - [`client/macos/v2ray-proxy-watchdog.sh`](client/macos/v2ray-proxy-watchdog.sh): Checks local `networksetup` state every 10s with **zero network traffic** and **unconditionally pins System Proxy to `127.0.0.1:10808`** (fail-closed during outages so browsers and Electron/AI desktop apps never leak direct domestic connections; pause manually via `touch ~/.local/state/v2ray-proxy-watchdog.pause`).
 
-### 5.2 Linux Session-Safe Watchdog (`client/linux/`)
-- [`client/linux/v2rayn-keepalive.sh`](client/linux/v2rayn-keepalive.sh): Uses zero-traffic kernel socket checks (`ss -tlnH sport = :10808`) and defers disruptive restarts while an active Claude Code session is running.
+### 5.2 Linux Session-Safe + Fail-Closed Watchdog (`client/linux/`)
+- [`client/linux/v2rayn-keepalive.sh`](client/linux/v2rayn-keepalive.sh): Uses zero-traffic kernel socket checks (`ss -tlnH sport = :10808`) and defers disruptive restarts while an active Claude Code session is running; also performs zero-beaconing GNOME `gsettings` fail-closed system proxy pinning to `127.0.0.1:10808` (preserving custom `ignore-hosts`, with `~/.local/state/v2ray-proxy-watchdog.pause` pause support).
 
 ### 5.3 Zero-Public-SSH Jump & `autossh` Config (`client/ssh/ssh-config.example`)
 Configure `~/.ssh/config` from [`client/ssh/ssh-config.example`](client/ssh/ssh-config.example), verify `ssh vps-jump` and `ssh vps-entry`, and then lock down your cloud firewalls per Section 1:
