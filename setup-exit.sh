@@ -22,7 +22,10 @@
 #      active empty-SNI probes never leak a mismatched CDN certificate.
 #   4. Listens on both 443 and an internal relay port (8443) with xver=0 and
 #      production-safe warning log level.
-#   5. Generates all credentials (UUID, X25519 key pair, ShortID) locally on
+#   5. Hardens 512MB/416MiB small-memory instances against Linux OOM-killer
+#      drops (OOMScoreAdjust=-900 on xray, journald 16M runtime cap, .hushlogin
+#      to suppress landscape-sysinfo SSH login spikes).
+#   6. Generates all credentials (UUID, X25519 key pair, ShortID) locally on
 #      run and prints a ready-to-import vless:// share link.
 #
 # Usage:
@@ -330,12 +333,35 @@ cat > "$CONFIG_FILE" <<EOF
 }
 EOF
 
+# ----- 6b. Low-Memory (512MB / 416MiB) OOM Immunity & Login Hygiene ----------
+info "Applying OOM protection for xray (OOMScoreAdjust=-900), journald cap, and .hushlogin..."
+mkdir -p /etc/systemd/system/xray.service.d
+cat > /etc/systemd/system/xray.service.d/oom-protect.conf <<'OOM_EOF'
+[Service]
+OOMScoreAdjust=-900
+OOM_EOF
+
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/lowmem.conf <<'JNL_EOF'
+[Journal]
+RuntimeMaxUse=16M
+SystemMaxUse=64M
+JNL_EOF
+journalctl --vacuum-size=32M >/dev/null 2>&1 || true
+
+touch /root/.hushlogin
+if [ -d /home/ubuntu ]; then
+  touch /home/ubuntu/.hushlogin
+  chown ubuntu:ubuntu /home/ubuntu/.hushlogin 2>/dev/null || true
+fi
+systemctl daemon-reload
+
 xray run -test -c "$CONFIG_FILE" >/dev/null
 systemctl restart xray
 systemctl enable xray >/dev/null 2>&1 || true
 
 sleep 1
-systemctl is-active --quiet xray && ok "Xray is active and listening on :$PORT and $PRIVATE_IP:$INTERNAL_PORT." \
+systemctl is-active --quiet xray && ok "Xray is active (OOMScoreAdjust=-900) and listening on :$PORT and $PRIVATE_IP:$INTERNAL_PORT." \
   || die "Xray failed to start. Check: journalctl -u xray -e"
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
@@ -378,6 +404,13 @@ echo "   (If the two VPSs are not in the same VPC subnet, use EXIT_HOST=${EXIT_P
 echo
 info "2) Client share link (saved to $CLIENT_FILE):"
 echo -e "   ${YELLOW}${SHARE_LINK}${NC}"
+echo
+warn "3) Exit VPS Cloud Firewall Golden Rules (e.g. AWS Lightsail Networking):"
+echo "   - Do NOT open public TCP 443 or 80 on this Fixed-Exit VPS (prevents scanner fingerprinting;"
+echo "     traffic enters privately from your Relay VPS over VPC ${PRIVATE_IP}:${INTERNAL_PORT})."
+echo "   - Restrict SSH (TCP 22) in IPv4 Firewall to ${EXIT_PUBLIC_IP:-<EXIT_PUBLIC_IP>}/32 (for 127.0.0.1:10808"
+echo "     SOCKS5 hairpin SSH across 1:1 cloud NAT) + your VPC CIDR (e.g. 172.26.0.0/20)."
+echo "   - Remove/close all public IPv6 inbound firewall rules."
 echo
 if command -v qrencode >/dev/null 2>&1 && [ -n "${RELAY_PUBLIC_IP:-}" ]; then
   info "QR code for mobile clients:"

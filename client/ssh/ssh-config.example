@@ -1,32 +1,83 @@
 # =============================================================================
-# Stealth Cross-Border SSH Jump / Reverse-Tunnel Configuration Example
+# Zero-Public-SSH Cross-Border Jump, VPC Hop & Reverse-Tunnel Config Example
 # =============================================================================
 # Why this matters:
-#   Running raw 24/7 SSH or `autossh` tunnels directly to your Entry Relay VPS
-#   exposes plaintext `SSH-2.0-OpenSSH` banners and fixed-size keepalive packets
-#   on the same IP as your port 443 proxy. Firewalls correlate multi-port
-#   activity from the same client IP and block the Entry VPS IP.
+#   1. Running raw 24/7 SSH or `autossh` directly to your Entry Relay VPS (:22 or
+#      :2222) alongside :443 exposes plaintext `SSH-2.0-OpenSSH` banners and
+#      keepalive timing from the same client IP, triggering multi-port blocking.
+#   2. Exposing HAProxy TCP relay `:2222 -> Exit:22` on the Entry Relay VPS leaks
+#      mismatched OpenSSH banners across Relay:22 and Relay:2222, letting global
+#      scanners correlate your Entry Relay with your Fixed-Exit IP.
+#   3. Auto-falling back to bare `:2222`/`:22` when `127.0.0.1:10808` blips leaks
+#      raw cross-border SSH packets at the exact moment the proxy is degraded.
 #
-# Solution:
-#   Use `ProxyCommand` to route SSH connections INSIDE your local VLESS+REALITY
-#   SOCKS5 proxy (127.0.0.1:10808) directly to the Exit VPS's SSH port, with
-#   automatic fallback to direct TCP (port 2222) only if the local proxy is down.
-#   Result: ZERO raw SSH packets cross the firewall during normal operation.
+# Hardened Architecture (Zero Public SSH Exposure + Rotation-Proof):
+#   - Exit VPS Cloud Firewall (`TCP 22` IPv4): allow ONLY `203.0.113.20/32`
+#     (self-hairpin across 1:1 cloud NAT when Exit Xray dials `203.0.113.20:22`)
+#     + `172.26.0.0/20` (VPC CIDR). Close `80`, `443`, and public IPv6.
+#     * Why `203.0.113.20` instead of `127.0.0.1` / `172.26.2.20` / `*.internal`?
+#       Standard client `v2rayN` / Xray routing rules send `geoip:private` and
+#       `geosite:private` (which includes `domain:internal`) to `direct` locally!
+#       Dialing `203.0.113.20:22` routes cleanly inside `127.0.0.1:10808` with
+#       zero client Xray routing changes while remaining 100% closed to the public.
+#   - Entry Relay Cloud Firewall: open ONLY `TCP 443` (`0.0.0.0/0` IPv4); restrict
+#     `TCP 22` to `172.26.0.0/20` (VPC); close `80`, `2222`, and public IPv6.
+#   - `Host vps-entry` jumps through `vps-jump` over the private VPC (`172.26.1.10`),
+#     so rotating your Entry Relay's Static IP requires ZERO SSH or firewall edits!
 #
-# Replace the RFC 5737 example IPs below with your own:
-#   198.51.100.10 -> Your Entry Relay VPS Public IP
-#   203.0.113.20  -> Your Fixed-Exit VPS Public IP
+# Replace the RFC 5737 / RFC 1918 placeholders below with your own:
+#   198.51.100.10 -> Entry Relay VPS Static Public IP
+#   172.26.1.10   -> Entry Relay VPS Private VPC IP
+#   203.0.113.20  -> Fixed-Exit VPS Static Public IP
+#   172.26.2.20   -> Fixed-Exit VPS Private VPC IP
+#   172.26.0.0/20 -> Cloud VPC Subnet CIDR
 # =============================================================================
 
-# --- macOS Client (~/.ssh/config) ---
-Host vps-jump
-    HostName 198.51.100.10
-    Port 2222
+# --- 1. macOS / Workstation Client (~/.ssh/config) ---
+Host vps-jump vps-exit
+    HostName 203.0.113.20
+    Port 22
     User ubuntu
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
-    # Prefer local REALITY SOCKS5 proxy (127.0.0.1:10808); auto-fallback to direct if proxy is down
-    ProxyCommand sh -c 'if nc -z -G 1 127.0.0.1 10808 2>/dev/null; then exec nc -X 5 -x 127.0.0.1:10808 203.0.113.20 22; else exec nc %h %p; fi'
+    # Strict fail-closed via local REALITY SOCKS5 proxy (no bare public SSH fallback).
+    # Note: macOS `/usr/bin/nc -G 8` sets TCP connect timeout only.
+    ProxyCommand nc -X 5 -x 127.0.0.1:10808 -G 8 203.0.113.20 22
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+    IPQoS none
+
+Host vps-entry
+    HostName 172.26.1.10
+    Port 22
+    HostKeyAlias 198.51.100.10
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    # Reaches Entry Relay over private VPC via Exit VPS (survives Entry IP rotation!)
+    ProxyCommand ssh -W %h:%p -o BatchMode=yes vps-jump
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+    IPQoS none
+
+# Manual-only emergency aliases (require temporarily opening TCP 22 in your cloud
+# console firewall first; NEVER referenced by automatic fallback)
+Host vps-exit-emergency
+    HostName 203.0.113.20
+    Port 22
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+    IPQoS none
+
+Host vps-entry-emergency
+    HostName 198.51.100.10
+    Port 22
+    User ubuntu
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
     ServerAliveInterval 30
     ServerAliveCountMax 4
     IPQoS none
@@ -37,6 +88,7 @@ Host dev-box-tunnel
     User devuser
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
+    HostKeyAlias dev-box
     ProxyCommand ssh -W %h:%p -o BatchMode=yes vps-jump
     ServerAliveInterval 30
     ServerAliveCountMax 6
@@ -44,15 +96,20 @@ Host dev-box-tunnel
     Compression yes
 
 
-# --- Linux Dev Machine (~/.ssh/config for autossh reverse tunnel) ---
+# --- 2. Linux Dev Machine (~/.ssh/config for `autossh -M 0 -N -R 127.0.0.1:6022:127.0.0.1:22 tunnel-vps`) ---
 Host tunnel-vps
-    HostName 198.51.100.10
-    Port 2222
+    HostName 203.0.113.20
+    Port 22
     User ubuntu
     IdentityFile ~/.ssh/id_ed25519_tunnel
     IdentitiesOnly yes
-    # On Linux (OpenBSD netcat), use -w 1 for local port probe
-    ProxyCommand sh -c 'if nc -z -w 1 127.0.0.1 10808 2>/dev/null; then exec nc -X 5 -x 127.0.0.1:10808 203.0.113.20 22; else exec nc %h %p; fi'
+    ConnectTimeout 20
+    # IMPORTANT (Ubuntu/Debian OpenBSD netcat pitfall):
+    # Do NOT pass `-w <sec>` to `/bin/nc.openbsd` here! On Linux `nc.openbsd`, `-w`
+    # acts as an IDLE DATA TIMEOUT (not just connect timeout) and will drop idle
+    # `autossh -N -R` reverse tunnels every `<sec>` seconds. Let SSH `ConnectTimeout`
+    # bound connection setup instead.
+    ProxyCommand nc -X 5 -x 127.0.0.1:10808 203.0.113.20 22
     ServerAliveInterval 30
     ServerAliveCountMax 3
     TCPKeepAlive yes

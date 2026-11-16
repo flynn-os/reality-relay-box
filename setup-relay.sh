@@ -18,8 +18,10 @@
 #   3. Installs HAProxy and verifies reachability to your Fixed-Exit VPS
 #      (automatically preferring low-latency VPC private IP if reachable).
 #   4. Configures SNI-aware TCP relay on port 443 (with xver=0 native passthrough
-#      so REALITY handshakes never break) plus optional fallback SSH relay on
-#      port 2222.
+#      so REALITY handshakes never break). Public SSH relay on port 2222 defaults
+#      to disabled (ENABLE_SSH_RELAY=false) because forwarding Relay:2222 -> Exit:22
+#      exposes Exit's OpenSSH banner alongside Relay:22, letting scanners correlate
+#      both servers; manage Relay privately over VPC via Exit instead.
 #
 # Usage:
 #   sudo EXIT_HOST=<exit-private-or-public-ip> bash setup-relay.sh
@@ -42,7 +44,10 @@ die()   { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 LISTEN_PORT="${LISTEN_PORT:-443}"
 EXIT_PORT="${EXIT_PORT:-8443}"
 SNI="${SNI:-d1.awsstatic.com}"
-ENABLE_SSH_RELAY="${ENABLE_SSH_RELAY:-true}"
+# Disabled by default: forwarding *:2222 -> Exit:22 leaks mismatched OpenSSH version
+# banners across Relay:22 and Relay:2222, correlating Entry Relay and Fixed-Exit IPs.
+# Set ENABLE_SSH_RELAY=true only if you explicitly want an opt-in port 2222 TCP forwarder.
+ENABLE_SSH_RELAY="${ENABLE_SSH_RELAY:-false}"
 SSH_RELAY_PORT="${SSH_RELAY_PORT:-2222}"
 EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"
 TCP_MSS="${TCP_MSS:-1280}"
@@ -189,7 +194,17 @@ fi
 
 # ----- 5. Write HAProxy configuration ----------------------------------------
 info "Writing HAProxy configuration to $HAPROXY_CFG ..."
-[ -f "$HAPROXY_CFG" ] && cp "$HAPROXY_CFG" "${HAPROXY_CFG}.bak-$(date +%Y%m%d-%H%M%S)"
+if [ -f "$HAPROXY_CFG" ]; then
+  HAPROXY_BAK="${HAPROXY_CFG}.bak-$(date +%Y%m%d-%H%M%S)"
+  cp "$HAPROXY_CFG" "$HAPROXY_BAK"
+  chmod 600 "$HAPROXY_BAK"
+fi
+
+touch /root/.hushlogin
+if [ -d /home/ubuntu ]; then
+  touch /home/ubuntu/.hushlogin
+  chown ubuntu:ubuntu /home/ubuntu/.hushlogin 2>/dev/null || true
+fi
 
 cat > "$HAPROXY_CFG" <<EOF
 global
@@ -257,7 +272,10 @@ echo -e "${GREEN}===============================================================
 echo
 ok "Relay Public IP : $RELAY_PUBLIC_IP"
 ok "Forwarding      : *:${LISTEN_PORT} -> ${EXIT_HOST}:${EXIT_PORT} (SNI: ${SNI})"
-[ "$ENABLE_SSH_RELAY" = "true" ] && ok "Emergency SSH   : *:${SSH_RELAY_PORT} -> ${EXIT_HOST}:${EXIT_SSH_PORT}"
+[ "$ENABLE_SSH_RELAY" = "true" ] && warn "Opt-in SSH Relay: *:${SSH_RELAY_PORT} -> ${EXIT_HOST}:${EXIT_SSH_PORT} (exposes Exit SSH banner if public)"
 echo
-warn "Reminder: open TCP port ${LISTEN_PORT} in your cloud console firewall (e.g. AWS Lightsail Networking)."
+warn "Entry Relay Cloud Firewall Golden Rules (e.g. AWS Lightsail Networking):"
+echo "  - Open ONLY TCP ${LISTEN_PORT} (0.0.0.0/0 IPv4) to the public internet (delete 80, 2222, and public IPv6 rules)."
+echo "  - Append your Exit VPS ~/.ssh/id_ed25519.pub to this Relay's ~ubuntu/.ssh/authorized_keys, verify"
+echo "    VPC login from Exit, then restrict Relay SSH (TCP 22) to your VPC CIDR (e.g. 172.26.0.0/20)."
 info "In your client (v2rayN), set the server address to: ${RELAY_PUBLIC_IP}"
