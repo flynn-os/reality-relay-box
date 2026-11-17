@@ -14,10 +14,10 @@
 #   - Emergency rotation (old Entry IP is already blocked): restarting is safe
 #     because old streams are already dead.
 #   - Preventive rotation during active long-running AI sessions: wait until
-#     streams are idle, or use a dual-port hot cutover (10808 -> 10809). If a
-#     dual-core hot transition (multiple `xray` PIDs or `xray-nofrag-10809.json`)
-#     is detected, this script updates configs on disk and skips killing `xray`
-#     unless `--force-restart` is explicitly passed.
+#     streams are idle, or use a dual-port hot cutover (10808 -> 10809). If an
+#     active dual-core transition (multiple running `xray` PIDs) is detected,
+#     this script updates configs on disk and skips killing `xray` unless
+#     `--force-restart` is explicitly passed.
 #
 # Usage:
 #   bash switch-relay-ip.sh [--force-restart | --no-restart] <NEW_RELAY_IP> [NEW_SNI]
@@ -166,7 +166,7 @@ fi
 PID_LIST="$(pgrep -x xray || true)"
 PID_COUNT="$(printf '%s\n' "$PID_LIST" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
 
-if { [ "$PID_COUNT" -gt 1 ] || [ -f "$HOT_CFG" ] || [ -f "$HOT_XHTTP_CFG" ]; } && [ "$FORCE_RESTART" -ne 1 ]; then
+if [ "$PID_COUNT" -gt 1 ] && [ "$FORCE_RESTART" -ne 1 ]; then
   echo "[!] Active dual-core hot-transition detected (xray PIDs=${PID_COUNT})."
   echo "[!] Updated configs on disk (0600) WITHOUT killing active xray cores to preserve established sessions."
   echo "[!] Re-run with --force-restart only if you intentionally want to terminate and restart local xray."
