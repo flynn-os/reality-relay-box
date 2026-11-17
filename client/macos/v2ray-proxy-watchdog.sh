@@ -27,34 +27,48 @@ set -u
 
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-10808}"
-SERVICE="${SERVICE:-Wi-Fi}"
-BYPASS="localhost 127.0.0.1 ::1 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10 *.local *.ts.net"
+SERVICES=("Wi-Fi" "USB 10/100/1000 LAN" "Tailscale")
+BYPASS=(
+  "localhost" "127.0.0.1" "::1"
+  "192.168.0.0/16" "10.0.0.0/8" "172.16.0.0/12" "100.64.0.0/10"
+  "*.local" "*.ts.net"
+  "dingtalk.com" "*.dingtalk.com" "*.dingtalkapps.com"
+  "*.alibabainc.com" "*.alicdn.com" "*.aliyuncs.com"
+)
 LOGFILE="$HOME/Library/Logs/v2ray-proxy-watchdog.log"
 PAUSE_FLAG="${PAUSE_FLAG:-$HOME/.local/state/v2ray-proxy-watchdog.pause}"
 
 log() { echo "[watchdog $(date '+%F %T')] $1" >> "$LOGFILE"; }
 
-proxy_ok() {
-  networksetup -getwebproxy "$SERVICE" 2>/dev/null | grep -q "Enabled: Yes" || return 1
-  networksetup -getwebproxy "$SERVICE" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
-  networksetup -getsecurewebproxy "$SERVICE" 2>/dev/null | grep -q "Enabled: Yes" || return 1
-  networksetup -getsecurewebproxy "$SERVICE" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
-  networksetup -getsocksfirewallproxy "$SERVICE" 2>/dev/null | grep -q "Enabled: Yes" || return 1
-  networksetup -getsocksfirewallproxy "$SERVICE" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
+service_proxy_ok() {
+  local svc="$1"
+  networksetup -getwebproxy "$svc" 2>/dev/null | grep -q "Enabled: Yes" || return 1
+  networksetup -getwebproxy "$svc" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
+  networksetup -getsecurewebproxy "$svc" 2>/dev/null | grep -q "Enabled: Yes" || return 1
+  networksetup -getsecurewebproxy "$svc" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
+  networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | grep -q "Enabled: Yes" || return 1
+  networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
 }
 
-restore_proxy() {
-  networksetup -setwebproxy "$SERVICE" "$PROXY_HOST" "$PROXY_PORT" \
-    && networksetup -setsecurewebproxy "$SERVICE" "$PROXY_HOST" "$PROXY_PORT" \
-    && networksetup -setsocksfirewallproxy "$SERVICE" "$PROXY_HOST" "$PROXY_PORT" \
-    && networksetup -setproxybypassdomains "$SERVICE" $BYPASS \
-    && log "restored system proxy -> ${PROXY_HOST}:${PROXY_PORT} (fail-closed)" \
-    || log "restore attempt failed"
+restore_service_proxy() {
+  local svc="$1"
+  networksetup -setwebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT" \
+    && networksetup -setsecurewebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT" \
+    && networksetup -setsocksfirewallproxy "$svc" "$PROXY_HOST" "$PROXY_PORT" \
+    && networksetup -setproxybypassdomains "$svc" "${BYPASS[@]}" \
+    && log "restored system proxy ($svc) -> ${PROXY_HOST}:${PROXY_PORT} (fail-closed)" \
+    || log "restore attempt failed ($svc)"
 }
 
 while true; do
-  if [[ ! -f "$PAUSE_FLAG" ]] && ! proxy_ok; then
-    restore_proxy
+  if [[ ! -f "$PAUSE_FLAG" ]]; then
+    for svc in "${SERVICES[@]}"; do
+      if networksetup -getwebproxy "$svc" >/dev/null 2>&1; then
+        if ! service_proxy_ok "$svc"; then
+          restore_service_proxy "$svc"
+        fi
+      fi
+    done
   fi
   sleep 10
 done

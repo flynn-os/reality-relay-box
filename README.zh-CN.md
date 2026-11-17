@@ -37,16 +37,18 @@
 ```
 [ 本机 macOS / Linux 开发机 ]
    │  1) 全工具共享单一本地代理 127.0.0.1:10808 (socks5h 远端解析 + 系统代理失败关闭锁定)
-   │  2) VLESS + REALITY (SNI: d1.awsstatic.com, Chrome 指纹, 禁用 TLS 分片)
-   │  3) 跨墙 SSH / autossh 严格封装进 10808 隧道内 (公网零 SSH 暴露, 无裸端口自动回退)
+   │  2) VLESS + XHTTP + xmux + REALITY (SNI: cognito-idp.ap-northeast-1.amazonaws.com, Chrome 指纹, 零分片)
+   │     └─ xmux 复用 (maxConcurrency 16-32 / 30-50min 周期平滑轮换底层 H2 连接, 消灭 200+ 并发与长死连接)
+   │  3) 国产背景噪音直连 (钉钉/音乐等), 指定邮箱 (如 126/yeah) 显式保留走代理
+   │  4) 跨墙 SSH / autossh 严格封装进 10808 隧道内 (公网零 SSH 暴露, 无裸端口自动回退)
    ▼
 [ 入口中转 VPS (Relay, 静态公网 198.51.100.10 / 私网 172.26.1.10) ]
    │  公网仅放行 IPv4 TCP :443 (关闭 80 / 2222 / 公网 22 / 公网 IPv6)
-   │  BBR+FQ + 双向 TCP MSS<=1280 (热点防卡死) + HAProxy SNI 透传转发
+   │  BBR+FQ + 双向 TCP MSS<=1280 + HAProxy (inspect-delay 2s) 按 SNI 双栈透传
    ▼  AWS 同区域 VPC 内网 (RTT ~0.15ms)
 [ 固定出口 VPS (Exit, 静态公网 203.0.113.20 / 私网 172.26.2.20) ]
    │  公网关闭 443 / 80 / 公网 IPv6; TCP :22 仅允许 203.0.113.20/32 (10808 自回环) + 172.26.0.0/20 (VPC)
-   │  Xray-core 监听内网 172.26.2.20:8443 (xver=0, OOMScoreAdjust=-900 免死保护)
+   │  xray-xhttp (:8444 XHTTP 主链, GOMEMLIMIT=48MiB) + xray (:8443 Vision 过渡兼容) [均 OOMScoreAdjust=-900]
    ▼
 [ Claude Code / ChatGPT / AI 工具 / 需代理开发与网页流量 (固定出口 203.0.113.20) ]
 ```
@@ -59,16 +61,16 @@
 
 | 编号 | 传统配法的常见破绽 / 故障根因 | 本项目的内置加固方案 |
 | :--- | :--- | :--- |
-| **1. 伪装域名 ASN 归属冲突** | 在 AWS 机器上把 `SNI`/`dest` 设为 `www.cloudflare.com`。被动 DPI 一眼识破 AWS IP（AS16509）承载 Cloudflare 域名（AS13335），且空 SNI 主动探测会直接吐出异网证书。 | 默认采用与 AWS 同属 `AS16509`、支持 TLS 1.3 + H2 的 **`d1.awsstatic.com`**：被动审查 ASN 100% 吻合；无 SNI 空探测拒绝握手，带 SNI 探测返回正宗 `Amazon RSA 2048 M04` 证书。 |
+| **1. 伪装域名与云服务器网段冲突** | 在 AWS Lightsail/EC2（`EC2` 计算网段）上用 `www.cloudflare.com` 甚至公认的 CloudFront 静态域名（如 `d1.awsstatic.com`，属 `CLOUDFRONT` 网段），且空/异名 SNI 探测会直接返回 7 字节 TLS 拒绝告警，与浏览器“连 CloudFront 拉 0 字节文件却开 200 条长连接”的行为严重矛盾。 | 默认采用真正部署在 **AWS 东京区域 `EC2/ALB` 计算网段** 的 **`cognito-idp.ap-northeast-1.amazonaws.com`**（备选 `oidc.ap-northeast-1.amazonaws.com`）：同网段 ASN/路由 100% 严丝合缝，国内直连可达，支持 TLS 1.3 + `h2`，且匹配/空/随机 SNI 探测均正常完成正宗 Amazon TLS 1.3 握手，消灭 7 字节拒绝指纹。 |
 | **2. 跨墙裸连 SSH 与自动裸回退泄露** | 客户端一边高并发连 `:443`，一边裸连 `:22`/`:2222` 跑 `autossh`；或在 `ProxyCommand` 中写 `else exec nc %h %p`，一旦本地代理抖动就自动向公网 `:2222` 发送明文 `SSH-2.0-OpenSSH` 握手，触发多端口关联封禁。 | [`client/ssh/ssh-config.example`](client/ssh/ssh-config.example) 将跨国 SSH / `autossh` 严格锁定在 `127.0.0.1:10808` 隧道内（无裸 `:2222`/`:22` 自动回退）；云防火墙对 `0.0.0.0/0` 彻底关闭 SSH，仅利用 `<EXIT_PUBLIC_IP>/32 + 172.26.0.0/20` 支持 `10808` 隧道自回环与 VPC 跳板登录。 |
-| **3. 出口公网扫描暴露与 `:2222` 横幅关联** | 出口机公网敞开 `:443` 被全球扫描器标记为代理；入口机用 HAProxy 把公网 `:2222` 转发到出口 `:22`，导致同一入口 IP 的 `:22` 与 `:2222` 暴露不同小版本的 OpenSSH 横幅，直接暴露双机转发关系；且常遗漏云平台独立的 IPv6 防火墙。 | HAProxy 仅走 **VPC 私网 `172.26.2.20:8443`** 转发；`setup-relay.sh` 默认关闭 `:2222` 转发（`ENABLE_SSH_RELAY=false`）；云防火墙同步关闭出口 `:443`/`:80`、入口 `:2222`/`:80` 以及两台机器的全部公网 IPv6 入站规则。 |
-| **4. 误配 `send-proxy-v2` 与 `xver`** | 在 HAProxy 加 `send-proxy-v2` 同时把 Xray `realitySettings.xver` 设为 `2`（`xver` 实为向伪装目标网站发送 PROXY 头），导致目标站立即 RST 重置连接。 | 严格保持 `realitySettings.xver: 0` 原生透传，配合 HAProxy `req_ssl_hello_type 1` 与 SNI 识别转发。 |
-| **5. 客户端 10 秒机械心跳与断流直连泄漏** | 传统守护脚本每 10 秒跨墙 `curl` 一次（每天 8,640 次等间隔信标指纹）；且一旦代理故障就不恢复系统代理，导致浏览器与桌面 AI 客户端静默退回国内宽带直连，暴露真实国内 IP。 | [`client/macos/v2ray-proxy-watchdog.sh`](client/macos/v2ray-proxy-watchdog.sh) 采用 **零心跳（Zero-Beaconing）+ 失败关闭锁定（Fail-Closed Pinning）**：纯本地检查 `networksetup`（0 网络流量），且即使 `10808` 故障也强制将系统代理锁定在 `127.0.0.1:10808`，使桌面应用安全报错而不直连泄漏（可通过 `touch ~/.local/state/v2ray-proxy-watchdog.pause` 手动暂停）。 |
-| **6. 首包固定分片特征与拥塞重传** | 对 REALITY 开启 `finalmask`（`tlshello` 50–100B 切片），不仅制造明显非浏览器特征，还会打碎首包导致中转层 HAProxy 无法解析完整 TLS SNI！ | 自动关闭客户端 `EnableFragment` 并清除 `finalmask`；双机默认开启 **TCP BBR + FQ** 并将 Xray 日志收紧为 `warning`。 |
+| **3. 出口公网扫描暴露与 `:2222` 横幅关联** | 出口机公网敞开 `:443` 被全球扫描器标记为代理；入口机用 HAProxy 把公网 `:2222` 转发到出口 `:22`，导致同一入口 IP 的 `:22` 与 `:2222` 暴露不同小版本的 OpenSSH 横幅，直接暴露双机转发关系；且常遗漏云平台独立的 IPv6 防火墙。 | HAProxy 仅走 **VPC 私网 `172.26.2.20:8444`/`8443`** 转发；`setup-relay.sh` 默认关闭 `:2222` 转发（`ENABLE_SSH_RELAY=false`）；云防火墙同步关闭出口 `:443`/`:80`、入口 `:2222`/`:80` 以及两台机器的全部公网 IPv6 入站规则。 |
+| **4. 误配 `send-proxy-v2`、`xver` 与超时等待** | 在 HAProxy 加 `send-proxy-v2` 同时把 Xray `realitySettings.xver` 设为 `2` 会导致目标站立即 RST 重置；`inspect-delay 5s` 在高并发丢包重传时会制造明显 `5001ms` 卡顿特征。 | 严格保持 `realitySettings.xver: 0` 原生透传，HAProxy 采用 `inspect-delay 2s` 与 SNI 识别双栈分发（新 `XHTTP` 走 `:8444`，旧 `Vision` 兼容走 `:8443`）。 |
+| **5. 客户端 10 秒机械心跳与断流直连泄漏** | 传统守护脚本每 10 秒跨墙 `curl` 一次（每天 8,640 次等间隔信标指纹）；且一旦代理故障就不恢复系统代理，导致浏览器与桌面 AI 客户端静默退回国内宽带直连，暴露真实国内 IP。 | [`client/macos/v2ray-proxy-watchdog.sh`](client/macos/v2ray-proxy-watchdog.sh) 与 [`client/linux/v2rayn-keepalive.sh`](client/linux/v2rayn-keepalive.sh) 采用 **零心跳（Zero-Beaconing）+ 失败关闭锁定（Fail-Closed Pinning）**：纯本地检查系统代理开关（0 网络流量），且即使 `10808` 故障也强制锁回本地代理端口，杜绝直连泄漏（可通过 `touch ~/.local/state/v2ray-proxy-watchdog.pause` 手动暂停）。 |
+| **6. 纯 Vision 高并发风暴、超长连接与分片特征** | 纯 `TCP + xtls-rprx-vision` 不做多路复用，浏览器/AI 多标签页并发时单国内 IP 会瞬间对单一非 CDN IP 发起上百条并发 TLS 握手（实测曾达 213 并发、28 小时 1.7 万次握手 + 17 小时不关的死连接），极易触发 GFW 统计阻断；误开 `finalmask` 分片更会破坏首包 SNI。 | 升级为 **`VLESS + XHTTP (mode: auto) + xmux`**：将几十路并发复用到 `1–2` 条标准 HTTP/2 连接（`maxConcurrency: "16-32"`），并通过 `hMaxRequestTimes: "600-900"` / `hMaxReusableSecs: "1800-3000"` 在后台周期性平滑轮换底层连接（上层不断流），彻底消除百路并发与 17 小时死连接指纹，同时禁用 TLS 分片并启用 **TCP BBR + FQ**。 |
 | **7. 手机热点 / 464XLAT 路径 MTU 黑洞（`-1ms` 卡死）** | AWS Nitro 网卡默认 `mtu 9001`，而现代 Chrome 后量子 `X25519MLKEM768` 使 `ClientHello` 达 `~1,850B`。切到 4G/5G 手机热点（IPv6 + 464XLAT 实际 MTU `1280~1380` 且丢弃 ICMP 分片差错）时，大包被静默黑洞丢弃，导致 `v2rayN` `-1ms`、SSH 卡死在 `KEX_ECDH_REPLY`。 | 双机内置持久化 `reality-tcp-mss.service`，对 `SYN`/`SYN-ACK` 做**双向只削峰不拔高**的 MSS 钳制（IPv4 `<=1280` / IPv6 `<=1220`）并开启 `net.ipv4.tcp_mtu_probing=1`，热更新零断流。 |
-| **8. 单一共享链路防泄漏与 Anycast 零误伤** | 把唯一代理拆成“仅某单一域名走代理”会导致其他需代理的 AI 工具与开发网站瘫痪；而用本地 `socks5://` 会把敏感域名发给国内 DNS 抢答污染；若在本地防火墙粗暴封禁 Cloudflare / Google GFE 等共享 Anycast 网段，又会误杀直连业务软件。 | 保持单一 `127.0.0.1:10808` 承载全部需代理工具，统一使用 **`ALL_PROXY=socks5h://127.0.0.1:10808`**（远端解析 DNS）+ `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` 配合系统代理失败关闭锁定，既杜绝 DNS/IP 直连泄漏，又对共享 Anycast CDN 零误伤。 |
-| **9. 小内存实例（512MB / 416MiB）OOM 免死保护** | 入门级 `$3.5~$5` 云主机可用物理内存常仅约 `416MiB`。SSH 登录触发 Ubuntu `landscape-sysinfo` 或 `journald` 日志暴涨时，Linux OOM-killer 极易直接强杀 `xray`，造成全线断流。 | `setup-exit.sh` 自动为 `xray` 注入 `OOMScoreAdjust=-900` 免死金牌，限制 `journald` 内存占用（`RuntimeMaxUse=16M`），并创建 `.hushlogin` 消除登录内存尖峰；同时避免在 416MiB 出口机上额外部署高内存后台守护进程。 |
-| **10. 入口静态 IP 解耦轮换（免改防火墙与 SSH）** | 若 SSH 配置或云防火墙硬编码了入口机公网 IP，每次换入口 IP 都容易改漏锁死自己。 | `vps-jump` 锚定固定出口 `203.0.113.20`，`vps-entry` 锚定入口机 **VPC 私网 IP `172.26.1.10`**（经出口内网跳板登录）。在控制台给入口机换绑新静态公网 IP 时，云防火墙与 SSH 配置**零改动**。 |
+| **8. 单一共享链路防泄漏、国产噪音分流与邮箱保底** | 拆成“仅 Claude 走代理”会瘫痪其他 AI/开发工具；用 `socks5://` 会泄漏 DNS；粗暴在 `pf`/`iptables` 封 Cloudflare/Google Anycast 段会误杀直连应用；而钉钉/音乐等国产后台长连接混进代理则会无谓放大海外并发基数（注意不能误把需走代理的国内邮箱如 `126` 一起放进直连）。 | 保持单一链路承载全部需代理工具，`ALL_PROXY=socks5h://127.0.0.1:10808` + `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` + 系统代理失败关闭锁定；在系统代理 Bypass 与 `v2rayN` 白名单中摘除纯国产后台噪音（如钉钉、`music.163.com` 等），并在 `geosite:cn` **上方**显式配置特定邮箱域名（如 `126.com`/`126.net`/`127.net`/`yeah.net`）走 `proxy`。 |
+| **9. 小内存实例（512MB / 416MiB）OOM 免死保护** | 入门级 `$3.5~$5` 云主机可用物理内存常仅约 `416MiB`。SSH 登录触发 `landscape-sysinfo` 或 `journald` 日志暴涨时，Linux OOM-killer 极易直接强杀 `xray`，造成全线断流。 | `setup-exit.sh` 为 `xray` 与 `xray-xhttp` 注入 `OOMScoreAdjust=-900` 免死金牌，为 `xray-xhttp` 限制 `GOMEMLIMIT=48MiB`，限制 `journald` 内存（`16M`）并创建 `.hushlogin` 消除登录尖峰。 |
+| **10. 入口静态 IP 解耦轮换与自动洗 IP 兜底** | 手工在网页换 IP 慢且容易抽中他人刚弃用的被封“脏 IP”；硬编码入口 IP 还会牵连 SSH 配置。 | `vps-jump` 锚定固定出口 `203.0.113.20`，`vps-entry` 锚定入口 VPC 私网 `172.26.1.10`。配套 [`rotate-lightsail-ip.sh`](rotate-lightsail-ip.sh) 可在代理被封时直连 AWS API 自动申请新静态 IP、从国内实测 `:443` 确认非脏 IP（否则自动释放重试）、清理旧 IP（\$0 账单残留）并同步两端客户端。 |
 
 ---
 
@@ -101,8 +103,8 @@ sudo RELAY_PUBLIC_IP=198.51.100.10 bash setup-exit.sh
 
 脚本会自动完成：
 1. 开启内核 `BBR + FQ`、`tcp_mtu_probing=1` 与持久化双向 TCP MSS 钳制（IPv4 `<=1280` / IPv6 `<=1220`）；
-2. 为 `xray.service` 写入 `OOMScoreAdjust=-900` 免死保护、限制 `journald` 内存（`16M`）并生成 `.hushlogin`；
-3. 安装 Xray-core，生成 UUID、X25519 密钥对与 ShortID，监听内网 `:8443`（及本机 `:443`，公网由云防火墙屏蔽）；
+2. 为 `xray-xhttp.service` 与 `xray.service` 写入 `OOMScoreAdjust=-900` 免死保护与 `GOMEMLIMIT=48MiB` 内存限制、限制 `journald` 内存（`16M`）并生成 `.hushlogin`；
+3. 安装 Xray-core，生成 UUID、X25519 密钥对与 ShortID，并行监听内网 `:8444`（XHTTP + `xmux` 主用）与 `:8443`（TCP Vision 兼容备选），公网均由云防火墙屏蔽；
 4. 输出下一步入口机安装命令与客户端 `vless://` 链接（保存在 `/root/reality-client.txt`，权限 `0600`）。
 
 ---
@@ -114,7 +116,7 @@ sudo RELAY_PUBLIC_IP=198.51.100.10 bash setup-exit.sh
    ```bash
    git clone https://github.com/flynn-os/reality-relay-box.git
    cd reality-relay-box
-   sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8443 SNI=d1.awsstatic.com bash setup-relay.sh
+   sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8444 LEGACY_PORT=8443 SNI=cognito-idp.ap-northeast-1.amazonaws.com bash setup-relay.sh
    ```
 
    *(默认 `ENABLE_SSH_RELAY=false`，不再暴露易被关联识别的 `:2222` 端口。)*
@@ -174,20 +176,19 @@ sudo RELAY_PUBLIC_IP=198.51.100.10 bash setup-exit.sh
 
 无论何时更换入口 IP，**固定出口 VPS（`203.0.113.20`）、UUID、REALITY 密钥与 ShortID 一律严禁改动**。推荐优先采用 **方式 A**：
 
-### 方式 A（强烈推荐）：在原入口实例上直接换绑静态 IP（10 秒完成，免重装）
-1. 在云控制台（如 Lightsail `Networking`）将旧静态 IP `198.51.100.10` 从入口机解绑删除，立即创建一个新静态 IP（如 `198.51.100.99`）绑定到**同一台**入口机上：
-   - **入口机服务无需重装**，**云防火墙规则无需修改**，**`~/.ssh/config`（`vps-jump` / `vps-entry`）也无需修改**！
-2. 在你的客户端机器上执行：
-   ```bash
-   bash switch-relay-ip.sh 198.51.100.99 d1.awsstatic.com
-   ```
+### 方式 A（强烈推荐）：一键自动化换绑并自动洗 IP（[`rotate-lightsail-ip.sh`](rotate-lightsail-ip.sh)）
+当入口 `:443` 确认被阻断时，可不经代理直连 AWS Lightsail API（内存盲输临时凭证，用完即焚，绝不落盘）自动换绑新静态 IP、从国内探测校验非脏 IP（若抽中脏 IP 自动释放重试最多 3 次）、释放旧静态 IP（\$0 账单残留）并同步更新本机与第二台开发机：
+```bash
+RELAY_PRIVATE_IP=172.26.1.10 bash rotate-lightsail-ip.sh
+```
+*(若想手动在控制台换 IP：解绑删除旧静态 IP `198.51.100.10` → 绑定新静态 IP `198.51.100.99` 到同一台入口机，无需重装服务或改防火墙/SSH，然后在客户端执行 `bash switch-relay-ip.sh 198.51.100.99 cognito-idp.ap-northeast-1.amazonaws.com`。)*
 
 ### 方式 B：新建一台入口中转实例
-1. 创建新同区域实例、绑定新静态 IP `198.51.100.99`，运行 `sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8443 SNI=d1.awsstatic.com bash setup-relay.sh`；
+1. 创建新同区域实例、绑定新静态 IP `198.51.100.99`，运行 `sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8444 LEGACY_PORT=8443 SNI=cognito-idp.ap-northeast-1.amazonaws.com bash setup-relay.sh`；
 2. 写入 SSH 公钥并按第 1 节收紧新入口机防火墙（仅公网放行 `TCP 443`，`TCP 22` 限 `172.26.0.0/20`）；若新入口机私网 IP 变了，同步更新 `~/.ssh/config` 中 `Host vps-entry` 的 `HostName`；
-3. 在客户端执行 `bash switch-relay-ip.sh 198.51.100.99 d1.awsstatic.com`。
+3. 在客户端执行 `bash switch-relay-ip.sh 198.51.100.99 cognito-idp.ap-northeast-1.amazonaws.com`。
 
-> **无感切换说明**：若旧入口 IP 已被阻断，直接运行 `switch-relay-ip.sh` 重启本地 `xray` 即可恢复；若属于预防性换 IP 且本机正跑着不能断的长连接，可等任务空闲后执行，或采用双端口（如 `10808`/`10809`）热切换——当脚本检测到本机存在多核热过渡态时，默认只安全更新磁盘配置（`0600`）而不强杀进程（除非显式传入 `--force-restart`）。
+> **无感切换说明**：若旧入口 IP 已被阻断，直接运行 `switch-relay-ip.sh` 重启本地 `xray` 即可恢复；若属于预防性换 IP 且本机正跑着不能断的长连接，可等任务空闲后执行，或采用双端口（如 `10808`/`10810`）热切换——当脚本检测到本机存在多核热过渡态时，默认只安全更新磁盘配置（`0600`）而不强杀进程（除非显式传入 `--force-restart`；仅改磁盘不重启可传 `--no-restart`）。
 
 ---
 
@@ -225,24 +226,25 @@ sysctl net.ipv4.tcp_mtu_probing net.ipv4.tcp_congestion_control
 ```
 - 若本机 Wi-Fi 与手机热点均 `Operation timed out`，而云控制台显示入口实例运行正常且防火墙放行了 `TCP 443`，说明入口静态 IP 已被阻断 → 按 **第 6 节（方式 A）** 仅更换入口静态 IP，**切勿改动固定出口机 IP 与密钥**。
 
-### 7.4 第四步：排查固定出口 VPS 内存 OOM 或 `xray` 异常
-通过 `ssh vps-jump` 登录出口机（若代理已断，可在云控制台临时开启浏览器 SSH / `lightsail-connect` 登录出口机）：
+### 7.4 第四步：排查固定出口 VPS 内存 OOM 或 `xray` / `xray-xhttp` 异常
+通过 `ssh vps-jump` 登录出口机（若代理已断，可在云控制台使用浏览器 SSH 登录出口机）：
 ```bash
-systemctl status xray --no-pager
+systemctl status xray xray-xhttp --no-pager
 free -m
 sudo dmesg -T | grep -iE 'oom|killed process' | tail -n 20
-cat /proc/$(pidof xray)/oom_score_adj
+cat /proc/$(pidof xray | awk '{print $1}')/oom_score_adj
 ```
-- 确认 `xray` 为 `active (running)`、Swap 已挂载启用，且 `oom_score_adj` 为 **`-900`**。若未生效，检查 `/etc/systemd/system/xray.service.d/oom-protect.conf`。
+- 确认 `xray`（`:8443`）与 `xray-xhttp`（`:8444`）均为 `active (running)`、Swap 已启用，且 `oom_score_adj` 为 **`-900`**。注意使用 XHTTP 传输时，客户端 `vless` `users[].flow` **必须为空/删除**（不可保留 `xtls-rprx-vision`），否则握手会报 `SSL_ERROR_SYSCALL`。
 
-### 7.5 第五步：排查入口 HAProxy 与 VPC `:8443` 内网通路
-从出口机经 VPC 登录入口机（`ssh ubuntu@172.26.1.10`），核对 HAProxy 状态及到出口机内网 `:8443` 的连通性：
+### 7.5 第五步：排查入口 HAProxy 与 VPC `:8444` / `:8443` 内网通路
+从出口机经 VPC 登录入口机（`ssh ubuntu@172.26.1.10`），核对 HAProxy 状态及到出口机内网 `:8444`（XHTTP）与 `:8443`（Vision）的连通性：
 ```bash
 systemctl status haproxy --no-pager
+nc -vz -w 3 172.26.2.20 8444
 nc -vz -w 3 172.26.2.20 8443
 sudo haproxy -c -f /etc/haproxy/haproxy.cfg
 ```
-- **高频隐藏坑点**：检查 `/etc/haproxy/haproxy.cfg` 中 `frontend reality_in` 的 `use_backend` 与 `default_backend` 是否**均指向 `172.26.2.20:8443`**（若历史配置把 `default_backend` 指向了 `172.26.2.20:443`，一旦客户端误开分片导致首包 SNI 解析失败或出口 `:443` 关闭，连接就会掉进死后端）。
+- **高频隐藏坑点**：检查 `/etc/haproxy/haproxy.cfg` 中 `frontend reality_in` 的 `use_backend` 与 `default_backend`：新 `XHTTP` SNI（`cognito-idp.ap-northeast-1.amazonaws.com` 等）及 `default_backend` 应指向 **`172.26.2.20:8444`**，旧 `Vision` SNI（`d1.awsstatic.com` 等）若仍在过渡期则指向 `172.26.2.20:8443`（切勿指向被防火墙屏蔽或无监听的死端口）。
 
 ### 7.6 第六步：排查跨墙 SSH（`vps-jump` / `vps-entry`）与 `autossh` 断连
 1. **`ssh vps-jump` 超时**：确认本地 `127.0.0.1:10808` 正常，且出口机云防火墙 IPv4 `TCP 22` 已包含出口机自身静态公网 IP **`203.0.113.20/32`**（1:1 NAT 自回环白名单）与 VPC 网段 `172.26.0.0/20`。

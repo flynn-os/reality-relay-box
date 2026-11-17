@@ -7,7 +7,7 @@
 #                                         |
 #                           (AWS VPC Private Network / TCP)
 #                                         v
-#                              [ Fixed-Exit VPS :8443 ] --> Internet / AI APIs
+#                              [ Fixed-Exit VPS :8444/:8443 ] --> Internet / AI APIs
 #
 # What this script does:
 #   1. Enables TCP BBR + FQ congestion control and RFC 4821 MTU probing
@@ -27,7 +27,7 @@
 #   sudo EXIT_HOST=<exit-private-or-public-ip> bash setup-relay.sh
 #
 # Example (same AWS region/VPC):
-#   sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8443 SNI=d1.awsstatic.com bash setup-relay.sh
+#   sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8444 LEGACY_PORT=8443 SNI=cognito-idp.ap-northeast-1.amazonaws.com bash setup-relay.sh
 # ----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -39,11 +39,13 @@ warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 die()   { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Please run as root: sudo EXIT_HOST=<ip> bash $0"
-[ -n "${EXIT_HOST:-}" ] || die "Missing EXIT_HOST. Usage: sudo EXIT_HOST=<exit-vps-ip> [EXIT_PORT=8443] [SNI=d1.awsstatic.com] bash $0"
+[ -n "${EXIT_HOST:-}" ] || die "Missing EXIT_HOST. Usage: sudo EXIT_HOST=<exit-vps-ip> [EXIT_PORT=8444] [LEGACY_PORT=8443] [SNI=cognito-idp.ap-northeast-1.amazonaws.com] bash $0"
 
 LISTEN_PORT="${LISTEN_PORT:-443}"
-EXIT_PORT="${EXIT_PORT:-8443}"
-SNI="${SNI:-d1.awsstatic.com}"
+EXIT_PORT="${EXIT_PORT:-8444}"
+LEGACY_PORT="${LEGACY_PORT:-8443}"
+SNI="${SNI:-cognito-idp.ap-northeast-1.amazonaws.com}"
+LEGACY_SNI="${LEGACY_SNI:-d1.awsstatic.com}"
 # Disabled by default: forwarding *:2222 -> Exit:22 leaks mismatched OpenSSH version
 # banners across Relay:22 and Relay:2222, correlating Entry Relay and Fixed-Exit IPs.
 # Set ENABLE_SSH_RELAY=true only if you explicitly want an opt-in port 2222 TCP forwarder.
@@ -228,14 +230,19 @@ defaults
 frontend reality_in
     bind *:${LISTEN_PORT}
     mode tcp
-    tcp-request inspect-delay 5s
+    tcp-request inspect-delay 2s
     tcp-request content accept if { req_ssl_hello_type 1 }
-    use_backend reality_aws if { req.ssl_sni -i ${SNI} }
-    default_backend reality_aws
+    use_backend reality_xhttp if { req.ssl_sni -i ${SNI} oidc.ap-northeast-1.amazonaws.com }
+    use_backend reality_legacy_vision if { req.ssl_sni -i ${LEGACY_SNI} a0.awsstatic.com }
+    default_backend reality_xhttp
 
-backend reality_aws
+backend reality_xhttp
     mode tcp
-    server reality_exit ${EXIT_HOST}:${EXIT_PORT}
+    server reality_exit_xhttp ${EXIT_HOST}:${EXIT_PORT}
+
+backend reality_legacy_vision
+    mode tcp
+    server reality_exit_vision ${EXIT_HOST}:${LEGACY_PORT}
 EOF
 
 if [ "$ENABLE_SSH_RELAY" = "true" ]; then
@@ -255,7 +262,7 @@ systemctl enable haproxy >/dev/null 2>&1 || true
 systemctl restart haproxy
 
 sleep 1
-systemctl is-active --quiet haproxy && ok "HAProxy is running and relaying :${LISTEN_PORT} -> ${EXIT_HOST}:${EXIT_PORT}." \
+systemctl is-active --quiet haproxy && ok "HAProxy is running and relaying :${LISTEN_PORT} -> ${EXIT_HOST}:${EXIT_PORT} (XHTTP) / :${LEGACY_PORT} (Vision)." \
   || die "HAProxy failed to start. Check: journalctl -u haproxy -e"
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
@@ -271,7 +278,7 @@ echo -e "${GREEN} Entry Relay VPS setup complete!${NC}"
 echo -e "${GREEN}========================================================================${NC}"
 echo
 ok "Relay Public IP : $RELAY_PUBLIC_IP"
-ok "Forwarding      : *:${LISTEN_PORT} -> ${EXIT_HOST}:${EXIT_PORT} (SNI: ${SNI})"
+ok "Forwarding      : *:${LISTEN_PORT} -> ${EXIT_HOST}:${EXIT_PORT} (SNI: ${SNI}) / :${LEGACY_PORT} (Legacy SNI: ${LEGACY_SNI})"
 [ "$ENABLE_SSH_RELAY" = "true" ] && warn "Opt-in SSH Relay: *:${SSH_RELAY_PORT} -> ${EXIT_HOST}:${EXIT_SSH_PORT} (exposes Exit SSH banner if public)"
 echo
 warn "Entry Relay Cloud Firewall Golden Rules (e.g. AWS Lightsail Networking):"

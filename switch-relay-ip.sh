@@ -20,24 +20,28 @@
 #     unless `--force-restart` is explicitly passed.
 #
 # Usage:
-#   bash switch-relay-ip.sh [--force-restart] <NEW_RELAY_IP> [NEW_SNI]
+#   bash switch-relay-ip.sh [--force-restart | --no-restart] <NEW_RELAY_IP> [NEW_SNI]
 #
 # Example:
-#   bash switch-relay-ip.sh 198.51.100.99 d1.awsstatic.com
+#   bash switch-relay-ip.sh 198.51.100.99 cognito-idp.ap-northeast-1.amazonaws.com
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
 umask 077
 
 FORCE_RESTART=0
+NO_RESTART=0
 POSITIONAL=()
 for arg in "$@"; do
   case "$arg" in
     --force-restart)
       FORCE_RESTART=1
       ;;
+    --no-restart)
+      NO_RESTART=1
+      ;;
     -h|--help)
-      echo "Usage: bash $0 [--force-restart] <NEW_RELAY_IP> [NEW_SNI]"
+      echo "Usage: bash $0 [--force-restart | --no-restart] <NEW_RELAY_IP> [NEW_SNI]"
       exit 0
       ;;
     *)
@@ -49,7 +53,7 @@ done
 NEW_IP="${POSITIONAL[0]:-}"
 NEW_SNI="${POSITIONAL[1]:-}"
 
-[ -n "$NEW_IP" ] || { echo "Usage: bash $0 [--force-restart] <NEW_RELAY_IP> [NEW_SNI]"; exit 1; }
+[ -n "$NEW_IP" ] || { echo "Usage: bash $0 [--force-restart | --no-restart] <NEW_RELAY_IP> [NEW_SNI]"; exit 1; }
 
 if [ "$(uname -s)" = "Darwin" ]; then
   V2RAYN_DIR="$HOME/Library/Application Support/v2rayN"
@@ -61,6 +65,7 @@ DB_FILE="$V2RAYN_DIR/guiConfigs/guiNDB.db"
 GUI_CFG="$V2RAYN_DIR/guiConfigs/guiNConfig.json"
 BIN_CFG="$V2RAYN_DIR/binConfigs/config.json"
 HOT_CFG="$HOME/.local/state/reality-relay-hot/xray-nofrag-10809.json"
+HOT_XHTTP_CFG="$HOME/.local/state/reality-xhttp-hot/xray-xhttp-10810.json"
 XRAY_BIN="$V2RAYN_DIR/bin/xray/xray"
 ASSET_DIR="$V2RAYN_DIR/bin"
 
@@ -76,11 +81,14 @@ fi
 if [ -f "$HOT_CFG" ]; then
   cp "$HOT_CFG" "${HOT_CFG}.bak-${TS}" && chmod 600 "${HOT_CFG}.bak-${TS}"
 fi
+if [ -f "$HOT_XHTTP_CFG" ]; then
+  cp "$HOT_XHTTP_CFG" "${HOT_XHTTP_CFG}.bak-${TS}" && chmod 600 "${HOT_XHTTP_CFG}.bak-${TS}"
+fi
 
-python3 - "$DB_FILE" "$GUI_CFG" "$BIN_CFG" "$HOT_CFG" "$NEW_IP" "$NEW_SNI" << 'PY'
+python3 - "$DB_FILE" "$GUI_CFG" "$BIN_CFG" "$HOT_CFG" "$HOT_XHTTP_CFG" "$NEW_IP" "$NEW_SNI" << 'PY'
 import json, os, sqlite3, sys
 
-db_file, gui_cfg, bin_cfg, hot_cfg, new_ip, new_sni = sys.argv[1:7]
+db_file, gui_cfg, bin_cfg, hot_cfg, hot_xhttp_cfg, new_ip, new_sni = sys.argv[1:8]
 
 conn = sqlite3.connect(db_file)
 if new_sni:
@@ -94,7 +102,7 @@ else:
         (new_ip, f"Reality-Relay-{new_ip}"),
     )
 conn.commit()
-print("[+] Updated guiNDB.db:", conn.execute("SELECT remarks, address, port, sni FROM ProfileItem").fetchall())
+print("[+] Updated guiNDB.db:", conn.execute("SELECT remarks, address, port, sni, network FROM ProfileItem").fetchall())
 conn.close()
 os.chmod(db_file, 0o600)
 
@@ -113,11 +121,18 @@ def update_xray_cfg(cfg_path):
     for ob in b.get("outbounds", []):
         if ob.get("tag") == "proxy":
             settings = ob.get("settings", {})
+            st = ob.get("streamSettings", {})
+            is_xhttp = st.get("network") == "xhttp"
             if "address" in settings:
                 settings["address"] = new_ip
+            if is_xhttp:
+                settings.pop("flow", None)
             for vn in settings.get("vnext", []):
                 vn["address"] = new_ip
-            st = ob.get("streamSettings", {})
+                if is_xhttp:
+                    vn.pop("flow", None)
+                    for u in vn.get("users", []):
+                        u.pop("flow", None)
             if new_sni and "realitySettings" in st:
                 st["realitySettings"]["serverName"] = new_sni
             if "finalmask" in st:
@@ -129,21 +144,30 @@ def update_xray_cfg(cfg_path):
 update_xray_cfg(bin_cfg)
 print("[+] Updated binConfigs/config.json (0600)")
 
-if os.path.exists(hot_cfg):
-    update_xray_cfg(hot_cfg)
-    print(f"[+] Updated hot-transition config {hot_cfg} (0600)")
+for extra_cfg in (hot_cfg, hot_xhttp_cfg):
+    if os.path.exists(extra_cfg):
+        update_xray_cfg(extra_cfg)
+        print(f"[+] Updated hot-transition config {extra_cfg} (0600)")
 PY
 
 XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" run -test -c "$BIN_CFG" >/dev/null
 if [ -f "$HOT_CFG" ]; then
   XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" run -test -c "$HOT_CFG" >/dev/null
 fi
+if [ -f "$HOT_XHTTP_CFG" ]; then
+  XRAY_LOCATION_ASSET="$ASSET_DIR" "$XRAY_BIN" run -test -c "$HOT_XHTTP_CFG" >/dev/null
+fi
+
+if [ "$NO_RESTART" -eq 1 ]; then
+  echo "[+] Updated configs on disk (0600) without restarting xray (--no-restart)."
+  exit 0
+fi
 
 PID_LIST="$(pgrep -x xray || true)"
 PID_COUNT="$(printf '%s\n' "$PID_LIST" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
 
-if { [ "$PID_COUNT" -gt 1 ] || [ -f "$HOT_CFG" ]; } && [ "$FORCE_RESTART" -ne 1 ]; then
-  echo "[!] Active dual-core hot-transition detected (xray PIDs=${PID_COUNT}, hot_cfg=$([ -f "$HOT_CFG" ] && echo present || echo absent))."
+if { [ "$PID_COUNT" -gt 1 ] || [ -f "$HOT_CFG" ] || [ -f "$HOT_XHTTP_CFG" ]; } && [ "$FORCE_RESTART" -ne 1 ]; then
+  echo "[!] Active dual-core hot-transition detected (xray PIDs=${PID_COUNT})."
   echo "[!] Updated configs on disk (0600) WITHOUT killing active xray cores to preserve established sessions."
   echo "[!] Re-run with --force-restart only if you intentionally want to terminate and restart local xray."
   exit 0

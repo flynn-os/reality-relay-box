@@ -17,25 +17,29 @@
 #   2. Configures persistent bidirectional TCP MSS clamping (<=1280 IPv4 / <=1220
 #      IPv6, ceiling-only) across SSH + REALITY ports so 4G/5G mobile hotspots
 #      (464XLAT/CLAT) never stall on AWS Jumbo Frame (MTU 9001) + Chrome PQ ClientHellos.
-#   3. Defaults to an ASN-aligned camouflage target (d1.awsstatic.com for AWS
-#      regions, TLS 1.3 + HTTP/2) so passive DPI sees 100% ASN consistency and
-#      active empty-SNI probes never leak a mismatched CDN certificate.
-#   4. Listens on both 443 and an internal relay port (8443) with xver=0 and
-#      production-safe warning log level.
+#   3. Defaults to an EC2-aligned regional camouflage target
+#      (cognito-idp.ap-northeast-1.amazonaws.com for AWS Tokyo, TLS 1.3 + HTTP/2)
+#      so passive DPI sees 100% EC2/ALB ASN+subnet consistency and active
+#      empty/random-SNI probes complete genuine Amazon TLS 1.3+h2 handshakes.
+#   4. Runs dual-stack VPC listeners: XHTTP+REALITY on :8444 (recommended for
+#      client xmux connection multiplexing to crush 200+ concurrent TCP bursts)
+#      and legacy Vision+REALITY on :8443 / :443, with xver=0 and warning logs.
 #   5. Hardens 512MB/416MiB small-memory instances against Linux OOM-killer
-#      drops (OOMScoreAdjust=-900 on xray, journald 16M runtime cap, .hushlogin
-#      to suppress landscape-sysinfo SSH login spikes).
+#      drops (OOMScoreAdjust=-900 on xray & xray-xhttp, GOMEMLIMIT=48MiB on
+#      xray-xhttp, journald 16M runtime cap, .hushlogin to suppress MOTD spikes).
 #   6. Generates all credentials (UUID, X25519 key pair, ShortID) locally on
-#      run and prints a ready-to-import vless:// share link.
+#      run and prints ready-to-import XHTTP & Vision vless:// share links.
 #
 # Usage:
 #   sudo bash setup-exit.sh
 #
 # Optional environment variable overrides:
 #   RELAY_PUBLIC_IP  Public IP of your Entry Relay VPS (embedded into share link)
-#   PORT             Primary listening port             (default: 443)
-#   INTERNAL_PORT    VPC internal listening port        (default: 8443)
-#   DEST             REALITY camouflage target host     (default: d1.awsstatic.com)
+#   PORT             Primary Vision listening port      (default: 443)
+#   INTERNAL_PORT    VPC Vision listening port          (default: 8443)
+#   XHTTP_PORT       VPC XHTTP+REALITY listening port   (default: 8444)
+#   XHTTP_PATH       XHTTP transport path               (default: /v1/token)
+#   DEST             REALITY camouflage target host     (default: cognito-idp.ap-northeast-1.amazonaws.com)
 #   SNI              TLS SNI shown to the firewall      (default: same as DEST)
 #   TCP_MSS          IPv4 TCP MSS ceiling for hotspots  (default: 1280)
 #   TAG              Client profile name                (default: Reality-Relay-<ip>)
@@ -51,12 +55,15 @@ die()   { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 
 PORT="${PORT:-443}"
 INTERNAL_PORT="${INTERNAL_PORT:-8443}"
-DEST="${DEST:-d1.awsstatic.com}"
+XHTTP_PORT="${XHTTP_PORT:-8444}"
+XHTTP_PATH="${XHTTP_PATH:-/v1/token}"
+DEST="${DEST:-cognito-idp.ap-northeast-1.amazonaws.com}"
 SNI="${SNI:-$DEST}"
 TCP_MSS="${TCP_MSS:-1280}"
 TCP_MSS6="${TCP_MSS6:-1220}"
 CONFIG_DIR="/usr/local/etc/xray"
 CONFIG_FILE="$CONFIG_DIR/config.json"
+XHTTP_CONFIG_FILE="$CONFIG_DIR/config-xhttp-${XHTTP_PORT}.json"
 CLIENT_FILE="/root/reality-client.txt"
 
 [ "$(id -u)" -eq 0 ] || die "Please run as root: sudo bash $0"
@@ -77,7 +84,7 @@ sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr net.ipv4
 ok "TCP congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown), tcp_mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unknown)"
 
 # ----- 1b. Configure Bidirectional TCP MSS Clamping (Hotspot/464XLAT Safe) ---
-MSS_PORTS="$(printf '%s\n' "22" "$PORT" "$INTERNAL_PORT" | awk '!seen[$0]++' | paste -sd, -)"
+MSS_PORTS="$(printf '%s\n' "22" "$PORT" "$INTERNAL_PORT" "$XHTTP_PORT" | awk '!seen[$0]++' | paste -sd, -)"
 info "Configuring zero-downtime bidirectional TCP MSS ceiling (IPv4<=${TCP_MSS}, IPv6<=${TCP_MSS6} on ports ${MSS_PORTS})..."
 install -d -m 0755 /usr/local/libexec
 cat > /usr/local/libexec/reality-tcp-mss <<'MSS_EOF'
@@ -357,19 +364,130 @@ fi
 systemctl daemon-reload
 
 xray run -test -c "$CONFIG_FILE" >/dev/null
+chmod 640 "$CONFIG_FILE"
+chown root:"$(id -gn nobody)" "$CONFIG_FILE" 2>/dev/null || chmod 644 "$CONFIG_FILE"
+
+info "Writing XHTTP+REALITY VPC configuration to $XHTTP_CONFIG_FILE ..."
+cat > "$XHTTP_CONFIG_FILE" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "$PRIVATE_IP",
+      "port": $XHTTP_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "xhttpSettings": {
+          "path": "$XHTTP_PATH",
+          "mode": "auto"
+        },
+        "sockopt": {
+          "tcpKeepAliveInterval": 15
+        },
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$DEST:443",
+          "xver": 0,
+          "serverNames": [
+            "$SNI"
+          ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [
+            "$SHORT_ID"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "network": "udp",
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "network": "tcp",
+        "outboundTag": "direct"
+      }
+    ]
+  }
+}
+EOF
+chmod 640 "$XHTTP_CONFIG_FILE"
+chown root:"$(id -gn nobody)" "$XHTTP_CONFIG_FILE" 2>/dev/null || true
+xray run -test -c "$XHTTP_CONFIG_FILE" >/dev/null
+
+cat > /etc/systemd/system/xray-xhttp.service <<UNIT_EOF
+[Unit]
+Description=Xray XHTTP+REALITY Service (Port ${XHTTP_PORT})
+After=network.target nss-lookup.target
+
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Environment="GOMEMLIMIT=48MiB" "GOGC=50"
+OOMScoreAdjust=-900
+ExecStart=/usr/local/bin/xray run -config ${XHTTP_CONFIG_FILE}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+systemctl daemon-reload
+
 systemctl restart xray
 systemctl enable xray >/dev/null 2>&1 || true
+systemctl restart xray-xhttp
+systemctl enable xray-xhttp >/dev/null 2>&1 || true
 
 sleep 1
-systemctl is-active --quiet xray && ok "Xray is active (OOMScoreAdjust=-900) and listening on :$PORT and $PRIVATE_IP:$INTERNAL_PORT." \
-  || die "Xray failed to start. Check: journalctl -u xray -e"
+systemctl is-active --quiet xray && ok "Xray Vision is active (OOMScoreAdjust=-900) on :$PORT and $PRIVATE_IP:$INTERNAL_PORT." \
+  || die "Xray Vision failed to start. Check: journalctl -u xray -e"
+systemctl is-active --quiet xray-xhttp && ok "Xray XHTTP is active (OOMScoreAdjust=-900) on $PRIVATE_IP:$XHTTP_PORT." \
+  || die "Xray XHTTP failed to start. Check: journalctl -u xray-xhttp -e"
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
   ufw allow "$PORT"/tcp >/dev/null 2>&1 || true
   ufw allow "$INTERNAL_PORT"/tcp >/dev/null 2>&1 || true
+  ufw allow "$XHTTP_PORT"/tcp >/dev/null 2>&1 || true
 fi
 
-SHARE_LINK="vless://${UUID}@${LINK_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}"
+ENCODED_PATH="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$XHTTP_PATH" 2>/dev/null || echo "%2Fv1%2Ftoken")"
+SHARE_LINK_XHTTP="vless://${UUID}@${LINK_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp&path=${ENCODED_PATH}&mode=auto#${TAG}-XHTTP"
+SHARE_LINK="vless://${UUID}@${LINK_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${TAG}-Vision"
 
 {
   echo "# VLESS + REALITY Fixed-Exit Server Info"
@@ -379,16 +497,20 @@ SHARE_LINK="vless://${UUID}@${LINK_IP}:${PORT}?encryption=none&flow=xtls-rprx-vi
   echo "Exit Private VPC IP    : $PRIVATE_IP"
   echo "Entry Relay IP in link : $LINK_IP"
   echo "External Port          : $PORT"
-  echo "Internal VPC Port      : $INTERNAL_PORT"
+  echo "VPC XHTTP Port         : $XHTTP_PORT (path: $XHTTP_PATH)"
+  echo "VPC Legacy Vision Port : $INTERNAL_PORT"
   echo "UUID                   : $UUID"
   echo "Public Key (pbk)       : $PUBLIC_KEY"
   echo "Short ID (sid)         : $SHORT_ID"
   echo "SNI / DEST             : $SNI"
   echo
   echo "Next step on your Entry Relay VPS:"
-  echo "  sudo EXIT_HOST=$PRIVATE_IP EXIT_PORT=$INTERNAL_PORT SNI=$SNI bash setup-relay.sh"
+  echo "  sudo EXIT_HOST=$PRIVATE_IP EXIT_PORT=$XHTTP_PORT LEGACY_PORT=$INTERNAL_PORT SNI=$SNI bash setup-relay.sh"
   echo
-  echo "Client Share Link (replace $LINK_IP with your Entry Relay Public IP if not set):"
+  echo "Recommended Client Share Link (XHTTP + REALITY; enable xmux in client for connection pooling):"
+  echo "$SHARE_LINK_XHTTP"
+  echo
+  echo "Legacy Client Share Link (TCP Vision + REALITY):"
   echo "$SHARE_LINK"
 } > "$CLIENT_FILE"
 chmod 600 "$CLIENT_FILE"
@@ -399,20 +521,20 @@ echo -e "${GREEN} Fixed-Exit VPS setup complete!${NC}"
 echo -e "${GREEN}========================================================================${NC}"
 echo
 info "1) Run this on your Entry Relay VPS (prefers private VPC IP $PRIVATE_IP):"
-echo -e "   ${YELLOW}sudo EXIT_HOST=${PRIVATE_IP} EXIT_PORT=${INTERNAL_PORT} SNI=${SNI} bash setup-relay.sh${NC}"
+echo -e "   ${YELLOW}sudo EXIT_HOST=${PRIVATE_IP} EXIT_PORT=${XHTTP_PORT} LEGACY_PORT=${INTERNAL_PORT} SNI=${SNI} bash setup-relay.sh${NC}"
 echo "   (If the two VPSs are not in the same VPC subnet, use EXIT_HOST=${EXIT_PUBLIC_IP:-YOUR_EXIT_IP} EXIT_PORT=${PORT})"
 echo
-info "2) Client share link (saved to $CLIENT_FILE):"
-echo -e "   ${YELLOW}${SHARE_LINK}${NC}"
+info "2) Recommended XHTTP client share link (saved to $CLIENT_FILE):"
+echo -e "   ${YELLOW}${SHARE_LINK_XHTTP}${NC}"
 echo
 warn "3) Exit VPS Cloud Firewall Golden Rules (e.g. AWS Lightsail Networking):"
 echo "   - Do NOT open public TCP 443 or 80 on this Fixed-Exit VPS (prevents scanner fingerprinting;"
-echo "     traffic enters privately from your Relay VPS over VPC ${PRIVATE_IP}:${INTERNAL_PORT})."
+echo "     traffic enters privately from your Relay VPS over VPC ${PRIVATE_IP}:${XHTTP_PORT}/${INTERNAL_PORT})."
 echo "   - Restrict SSH (TCP 22) in IPv4 Firewall to ${EXIT_PUBLIC_IP:-<EXIT_PUBLIC_IP>}/32 (for 127.0.0.1:10808"
 echo "     SOCKS5 hairpin SSH across 1:1 cloud NAT) + your VPC CIDR (e.g. 172.26.0.0/20)."
 echo "   - Remove/close all public IPv6 inbound firewall rules."
 echo
 if command -v qrencode >/dev/null 2>&1 && [ -n "${RELAY_PUBLIC_IP:-}" ]; then
-  info "QR code for mobile clients:"
-  qrencode -t ANSIUTF8 "$SHARE_LINK"
+  info "QR code for mobile clients (XHTTP):"
+  qrencode -t ANSIUTF8 "$SHARE_LINK_XHTTP"
 fi

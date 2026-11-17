@@ -37,16 +37,18 @@ Running a single-VPS proxy creates a structural dilemma:
 ```
 [ Client (macOS / Linux Dev Machine) ]
    │  1) Single shared proxy 127.0.0.1:10808 (socks5h remote DNS + fail-closed System Proxy pin)
-   │  2) VLESS + REALITY (SNI: d1.awsstatic.com, Chrome FP, TLS Fragmentation OFF)
-   │  3) Cross-border SSH / autossh strictly inside 10808 (Zero public SSH, no bare fallback)
+   │  2) VLESS + XHTTP + xmux + REALITY (SNI: cognito-idp.ap-northeast-1.amazonaws.com, Chrome FP, No Fragment)
+   │     └─ xmux pooling (maxConcurrency 16-32, 30-50min graceful connection rotation — eliminates 200+ TCP bursts)
+   │  3) Domestic background noise direct (chat/music), forced proxy for required webmail (e.g. 126/yeah)
+   │  4) Cross-border SSH / autossh strictly inside 10808 (Zero public SSH, no bare fallback)
    ▼
 [ Entry Relay VPS (Static Public 198.51.100.10 / Private VPC 172.26.1.10) ]
    │  Public firewall: ONLY IPv4 TCP :443 open (80 / 2222 / public 22 / public IPv6 CLOSED)
-   │  BBR+FQ + bidirectional TCP MSS<=1280 (hotspot-safe) + HAProxy SNI passthrough
+   │  BBR+FQ + bidirectional TCP MSS<=1280 + HAProxy (inspect-delay 2s) dual-stack SNI routing
    ▼  AWS Same-Region Private VPC (RTT ~0.15ms)
 [ Fixed-Exit VPS (Static Public 203.0.113.20 / Private VPC 172.26.2.20) ]
    │  Public 443 / 80 / IPv6 CLOSED; TCP :22 restricted to 203.0.113.20/32 (hairpin) + 172.26.0.0/20 (VPC)
-   │  Xray-core on private 172.26.2.20:8443 (xver=0, OOMScoreAdjust=-900 immunity)
+   │  xray-xhttp (:8444 XHTTP primary, GOMEMLIMIT=48MiB) + xray (:8443 Vision compat) [both OOMScoreAdjust=-900]
    ▼
 [ Claude Code / ChatGPT / AI Dev Tools / Proxied Web (Static Egress 203.0.113.20) ]
 ```
@@ -59,16 +61,16 @@ Running a single-VPS proxy creates a structural dilemma:
 
 | # | Common Misconfiguration / Failure Mode | How `reality-relay-box` Fixes It |
 | :--- | :--- | :--- |
-| **1. SNI ↔ ASN Conflict** | Setting `SNI`/`dest` to `www.cloudflare.com` on an AWS VPS. Passive DPI flags `SNI=www.cloudflare.com` (AS13335) going to an AWS IP (AS16509), and empty-SNI active probes return Cloudflare's certificate from an AWS IP. | Defaults to **`d1.awsstatic.com`** (AWS official static CDN, AS16509, TLS 1.3 + HTTP/2). Passive DPI sees 100% ASN alignment; empty-SNI probes fail handshake like a real CloudFront edge, and SNI probes return a genuine `Amazon RSA 2048 M04` certificate. |
+| **1. SNI ↔ EC2 Subnet Mismatch** | Using `www.cloudflare.com` or even CloudFront-only domains (e.g. `d1.awsstatic.com`, `CLOUDFRONT` range) on an AWS `EC2`/Lightsail IP contradicts AWS `ip-ranges.json`, yields 7-byte empty-SNI rejection alerts, and makes 200+ multi-hour flows look unnatural against a 0-byte static edge. | Defaults to **`cognito-idp.ap-northeast-1.amazonaws.com`** (with `oidc.ap-northeast-1.amazonaws.com` alt): lives on AWS Tokyo **`EC2` compute IP ranges**, is directly reachable from China, supports TLS 1.3 + `h2`, and completes authentic Amazon TLS 1.3 handshakes on matching, empty, and random-SNI active probes (eliminating 7-byte alert signatures). |
 | **2. Raw Cross-Border SSH & Bare Fallback Leaks** | Running 24/7 `autossh` to `:22`/`:2222` alongside `:443`, or writing `else exec nc %h %p` in `ProxyCommand` so SSH automatically falls back to bare `:2222` whenever `10808` blips — leaking `SSH-2.0-OpenSSH` banners from the same client IP. | [`client/ssh/ssh-config.example`](client/ssh/ssh-config.example) locks SSH / `autossh` strictly inside `127.0.0.1:10808` with **no automatic bare `:2222`/`:22` fallback**; cloud SSH is closed to `0.0.0.0/0` via `<EXIT_PUBLIC_IP>/32 + 172.26.0.0/20` hairpin + private VPC jump. |
-| **3. Exit Scanner Exposure & `:2222` Banner Correlation** | Leaving Exit `:443` open exposes your Fixed-Exit IP to Censys/Shodan REALITY scans; forwarding Entry `:2222 -> Exit:22` exposes mismatched OpenSSH patch banners across Entry `:22` and `:2222` (correlating both servers); forgetting cloud IPv6 firewalls leaves `[::]:22`/`:443` open. | Relays solely over **VPC `172.26.2.20:8443`**; `setup-relay.sh` disables `:2222` relay by default (`ENABLE_SSH_RELAY=false`); cloud firewall rules close Exit `:443`/`:80`, Entry `:2222`/`:80`, and **all public IPv6 inbound rules** on both instances. |
-| **4. Broken `send-proxy-v2` / `xver` Pairing** | Setting `realitySettings.xver: 2` sends a PROXY header *outbound* to the camouflage site `dest`, causing immediate TCP resets. | Enforces `realitySettings.xver: 0` with HAProxy SNI TCP passthrough (`req_ssl_hello_type 1`). |
-| **5. Client Beaconing & Silent Fail-Open Leaks** | Polling `gstatic.com` every 10s emits 8,640 fixed-interval TLS handshakes/day across the firewall; worse, watchdogs that only re-enable macOS System Proxy when healthy leave System Proxy **OFF** during outages, causing browsers and desktop AI apps to connect directly over your domestic ISP! | [`client/macos/v2ray-proxy-watchdog.sh`](client/macos/v2ray-proxy-watchdog.sh) combines **Zero-Beaconing** (`0` outbound probes/day, pure local `networksetup` check) with **Fail-Closed Pinning** (keeps System Proxy locked to `127.0.0.1:10808` even if `xray` crashes so apps fail closed instead of leaking; pause manually via `touch ~/.local/state/v2ray-proxy-watchdog.pause`). |
-| **6. Artificial TLS Hello Fragmentation** | Enabling `tlshello` fragmentation (`finalmask` 50–100B) creates a non-browser signature and splits `ClientHello` across segments so HAProxy SNI inspection can fail. | Disables `EnableFragment` and strips `finalmask`, enables **TCP BBR + FQ** on both VPSs, and sets Xray logging to `warning`. |
+| **3. Exit Scanner Exposure & `:2222` Banner Correlation** | Leaving Exit `:443` open exposes your Fixed-Exit IP to Censys/Shodan REALITY scans; forwarding Entry `:2222 -> Exit:22` exposes mismatched OpenSSH patch banners across Entry `:22` and `:2222` (correlating both servers); forgetting cloud IPv6 firewalls leaves `[::]:22`/`:443` open. | Relays solely over **VPC `172.26.2.20:8444`/`8443`**; `setup-relay.sh` disables `:2222` relay by default (`ENABLE_SSH_RELAY=false`); cloud firewall rules close Exit `:443`/`:80`, Entry `:2222`/`:80`, and **all public IPv6 inbound rules** on both instances. |
+| **4. Broken `send-proxy-v2` / `xver` & Delay Timeouts** | Setting `realitySettings.xver: 2` sends a PROXY header *outbound* to `dest`, causing TCP resets; a `5s` HAProxy `inspect-delay` exposes `5001ms` timeout clusters during packet loss. | Enforces `realitySettings.xver: 0` with HAProxy `inspect-delay 2s` routing `XHTTP` SNIs (`default_backend`) to `:8444` and legacy `Vision` SNIs to `:8443`. |
+| **5. Client Beaconing & Silent Fail-Open Leaks** | Polling `gstatic.com` every 10s emits 8,640 fixed-interval TLS handshakes/day across the firewall; worse, watchdogs that only re-enable System Proxy when healthy leave System Proxy **OFF** during outages, causing browsers and desktop AI apps to leak domestic IPs! | [`client/macos/v2ray-proxy-watchdog.sh`](client/macos/v2ray-proxy-watchdog.sh) and [`client/linux/v2rayn-keepalive.sh`](client/linux/v2rayn-keepalive.sh) combine **Zero-Beaconing** (`0` outbound probes/day) with **Fail-Closed Pinning** (keeping OS proxy locked to `127.0.0.1:10808` during outages; pause via `touch ~/.local/state/v2ray-proxy-watchdog.pause`). |
+| **6. TCP Vision 200+ Concurrency Bursts & Multi-Hour Connections** | Plain `TCP + xtls-rprx-vision` opens a new TCP/TLS socket per flow with zero multiplexing — causing single client IPs running browsers + AI coding tools to hit 200+ concurrent flows, 17,000+ daily handshakes, and 17-hour stagnant sockets (prime GFW statistical blocking triggers); `finalmask` fragmentation also breaks SNI parsing. | Upgrades to **`VLESS + XHTTP (mode: auto) + xmux`**, collapsing 20+ concurrent requests into **1–2 HTTP/2 connections** (`maxConcurrency: "16-32"`), while `hMaxRequestTimes: "600-900"` / `hMaxReusableSecs: "1800-3000"` silently cycle underlying H2 connections without dropping upper-layer AI streams, plus **TCP BBR + FQ** and zero TLS fragmentation. |
 | **7. Mobile Hotspot / 464XLAT MTU Blackholes (`-1ms`)** | AWS Nitro NICs default to `mtu 9001` while Chrome Post-Quantum `X25519MLKEM768` produces `~1,850B` `ClientHello`s. On 4G/5G hotspots (IPv6 + 464XLAT MTU `1280–1380` with dropped ICMP `Frag Needed`), `1500B` (`DF=1`) packets blackhole — causing `v2rayN` `-1ms` timeouts and hung SSH `KEX_ECDH_REPLY`. | Installs persistent `reality-tcp-mss.service` on both VPSs for ceiling-only bidirectional `SYN`/`SYN-ACK` MSS clamping (`<=1280` IPv4 / `<=1220` IPv6) plus `net.ipv4.tcp_mtu_probing=1` with zero stream drops. |
-| **8. Single Shared Proxy & Anti-DNS/IP Leak (Zero Anycast Collateral)** | Splitting traffic into "Claude-only proxy" breaks other AI/dev tools sharing the link; using `socks5://` leaks DNS queries to domestic resolvers; blocking shared Cloudflare / Google GFE Anycast CIDRs in host `pf`/`iptables` collateralizes unproxied direct apps. | Routes all proxy-requiring tools through the single `127.0.0.1:10808` link with **`ALL_PROXY=socks5h://127.0.0.1:10808`** (remote DNS) + `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` + pinned System Proxy — preventing DNS/IP leaks with zero Anycast collateral damage. |
-| **9. Small-Memory (`512MB` / `416MiB`) OOM Immunity** | Entry-level `$3.5–$5` VPS instances have only `~416MiB` usable RAM. SSH login `landscape-sysinfo` spikes or `journald` growth can trigger the Linux OOM-killer to kill `xray`, severing all active proxy sessions. | `setup-exit.sh` sets `OOMScoreAdjust=-900` on `xray`, caps `journald` (`RuntimeMaxUse=16M`), creates `.hushlogin` to eliminate MOTD login spikes, and avoids heavy extra daemons on 416MiB Exit instances. |
-| **10. Decoupled Entry Static IP Rotation** | Hardcoding the Entry public IP in SSH configs or cloud firewall rules makes IP rotation error-prone and risks SSH lockouts. | Anchors `vps-jump` on Fixed-Exit `203.0.113.20` and `vps-entry` on Relay private IP `172.26.1.10` (over VPC). Swapping the Entry Relay's Static IP in the cloud console requires **zero** firewall or SSH config changes. |
+| **8. Single Shared Proxy, Noise Reduction & Anycast Safety** | Splitting into "Claude-only proxy" breaks other AI/dev tools; `socks5://` leaks DNS; blocking Cloudflare/Google GFE CIDRs breaks direct apps; domestic background apps (chat/music) needlessly inflate proxy concurrency unless bypassed while keeping specific proxied webmail (`126`/`yeah`) forced over `proxy`. | Keeps all proxy tools on `127.0.0.1:10808` with `ALL_PROXY=socks5h://127.0.0.1:10808` + `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` + Fail-Closed System Proxy pinning; bypasses noisy domestic chat/music apps while explicitly placing required mail domains (`126.com`/`126.net`/`127.net`/`yeah.net`) on `proxy` **above** `geosite:cn`. |
+| **9. Small-Memory (`512MB` / `416MiB`) OOM Immunity** | Entry-level `$3.5–$5` VPS instances have only `~416MiB` usable RAM. SSH login `landscape-sysinfo` spikes or `journald` growth can trigger the Linux OOM-killer to kill `xray`, severing all active proxy sessions. | `setup-exit.sh` sets `OOMScoreAdjust=-900` on `xray` & `xray-xhttp`, caps `xray-xhttp` with `GOMEMLIMIT=48MiB`, caps `journald` (`RuntimeMaxUse=16M`), and creates `.hushlogin` to eliminate MOTD login spikes. |
+| **10. Decoupled Entry IP Rotation & Clean-IP Auto-Verifier** | Manual console swaps are slow and can accidentally pick a dirty/already-blocked recycled IP; hardcoding the Entry IP in SSH configs risks lockouts. | Anchors `vps-jump` on Fixed-Exit `203.0.113.20` and `vps-entry` on Relay private IP `172.26.1.10`. [`rotate-lightsail-ip.sh`](rotate-lightsail-ip.sh) calls AWS Lightsail APIs directly from China, retries up to 3x until `:443` passes direct reachability, releases old Static IPs (\$0 idle fee), and syncs clients. |
 
 ---
 
@@ -99,7 +101,7 @@ cd reality-relay-box
 sudo RELAY_PUBLIC_IP=198.51.100.10 bash setup-exit.sh
 ```
 
-This configures `BBR + FQ`, `tcp_mtu_probing=1`, bidirectional `reality-tcp-mss` clamping (`<=1280` IPv4 / `<=1220` IPv6), `OOMScoreAdjust=-900` on `xray`, `journald` `16M` cap, `.hushlogin`, and Xray VLESS+REALITY on private `:8443`, saving your `vless://` link to `/root/reality-client.txt` (`0600`).
+This configures `BBR + FQ`, `tcp_mtu_probing=1`, bidirectional `reality-tcp-mss` clamping (`<=1280` IPv4 / `<=1220` IPv6), `OOMScoreAdjust=-900` and `GOMEMLIMIT=48MiB` on `xray-xhttp` and `xray`, `journald` `16M` cap, `.hushlogin`, and Xray VLESS+REALITY side-by-side on private `:8444` (XHTTP + `xmux` primary) and `:8443` (TCP Vision legacy fallback), saving your `vless://` links to `/root/reality-client.txt` (`0600`).
 
 ---
 
@@ -110,7 +112,7 @@ This configures `BBR + FQ`, `tcp_mtu_probing=1`, bidirectional `reality-tcp-mss`
    ```bash
    git clone https://github.com/flynn-os/reality-relay-box.git
    cd reality-relay-box
-   sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8443 SNI=d1.awsstatic.com bash setup-relay.sh
+   sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8444 LEGACY_PORT=8443 SNI=cognito-idp.ap-northeast-1.amazonaws.com bash setup-relay.sh
    ```
 
    *(`ENABLE_SSH_RELAY` defaults to `false` so `:2222` is not exposed.)*
@@ -170,19 +172,18 @@ Configure `~/.ssh/config` from [`client/ssh/ssh-config.example`](client/ssh/ssh-
 
 Whenever an Entry IP is blocked, **NEVER change your Fixed-Exit IP (`203.0.113.20`), UUID, REALITY keys, or ShortID**. Prefer **Method A**:
 
-### Method A (Recommended): Swap Static IP on the Existing Relay Instance (~10s)
-1. In your cloud console (e.g., Lightsail *Networking*), detach/delete the old Static IP (`198.51.100.10`) from the Entry Relay instance and attach a newly created Static IP (`198.51.100.99`) to the **same** Entry Relay instance:
-   - **Zero server rebuilds, zero firewall edits, and zero `~/.ssh/config` edits!**
-2. Update your client(s):
-   ```bash
-   bash switch-relay-ip.sh 198.51.100.99 d1.awsstatic.com
-   ```
+### Method A (Recommended): Automated Clean-IP Swap via [`rotate-lightsail-ip.sh`](rotate-lightsail-ip.sh)
+When Entry `:443` is confirmed blocked, run [`rotate-lightsail-ip.sh`](rotate-lightsail-ip.sh) directly against the AWS Lightsail regional API (in-memory hidden credentials, zero disk persistence): it allocates a new Static IP, tests TCP `:443` from China (retrying up to 3x if an inherited IP is already blocked), releases the old Static IP (\$0 idle fee), and updates both local and peer client configs:
+```bash
+RELAY_PRIVATE_IP=172.26.1.10 bash rotate-lightsail-ip.sh
+```
+*(Manual alternative: swap the Static IP `198.51.100.10 -> 198.51.100.99` on the same Relay instance in the console with zero firewall/SSH changes, then run `bash switch-relay-ip.sh 198.51.100.99 cognito-idp.ap-northeast-1.amazonaws.com`.)*
 
 ### Method B: Provision a New Entry Relay Instance
-1. Create a new Relay instance in the same region, bind Static IP `198.51.100.99`, and run `sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8443 SNI=d1.awsstatic.com bash setup-relay.sh`.
-2. Add SSH public keys, apply the Entry firewall matrix from Section 1 (`TCP 443` public, `TCP 22` VPC-only), update `Host vps-entry` `HostName` if the private VPC IP changed, and run `bash switch-relay-ip.sh 198.51.100.99 d1.awsstatic.com` on clients.
+1. Create a new Relay instance in the same region, bind Static IP `198.51.100.99`, and run `sudo EXIT_HOST=172.26.2.20 EXIT_PORT=8444 LEGACY_PORT=8443 SNI=cognito-idp.ap-northeast-1.amazonaws.com bash setup-relay.sh`.
+2. Add SSH public keys, apply the Entry firewall matrix from Section 1 (`TCP 443` public, `TCP 22` VPC-only), update `Host vps-entry` `HostName` if the private VPC IP changed, and run `bash switch-relay-ip.sh 198.51.100.99 cognito-idp.ap-northeast-1.amazonaws.com` on clients.
 
-> **Active Stream Safety**: If the old Entry IP is already dead, running `switch-relay-ip.sh` restarts local `xray` immediately. For preventive rotation during live long-running tasks, wait until sessions are idle or use a dual-port hot cutover (`10808`/`10809`) — if `switch-relay-ip.sh` detects multiple `xray` PIDs or `xray-nofrag-10809.json`, it updates configs (`0600`) without killing active `xray` cores unless `--force-restart` is passed.
+> **Active Stream Safety**: If the old Entry IP is already dead, running `switch-relay-ip.sh` restarts local `xray` immediately. For preventive rotation during live long-running tasks, wait until sessions are idle or use a dual-port hot cutover (`10808`/`10810`) — if `switch-relay-ip.sh` detects multiple `xray` PIDs or a hot-transition config, it updates configs (`0600`) without killing active `xray` cores unless `--force-restart` is passed (pass `--no-restart` to only update disk configs).
 
 ---
 
@@ -220,24 +221,25 @@ Test raw TCP handshake from your client directly to Entry `:443` (bypassing `108
 ```
 - If `198.51.100.10:443` times out across networks while the Relay instance is running and `TCP 443` is open in the cloud firewall, the Entry IP is blocked → rotate **only** the Entry Static IP per **Section 6 (Method A)**.
 
-### 7.4 Fixed-Exit VPS OOM or `xray` Service Check
-Log into Exit via `ssh vps-jump` (or temporarily enable cloud console Browser SSH / `lightsail-connect` if `10808` is down):
+### 7.4 Fixed-Exit VPS OOM or `xray` / `xray-xhttp` Service Check
+Log into Exit via `ssh vps-jump` (or use cloud console Browser SSH if `10808` is down):
 ```bash
-systemctl status xray --no-pager
+systemctl status xray xray-xhttp --no-pager
 free -m
 sudo dmesg -T | grep -iE 'oom|killed process' | tail -n 20
-cat /proc/$(pidof xray)/oom_score_adj
+cat /proc/$(pidof xray | awk '{print $1}')/oom_score_adj
 ```
-Confirm `xray` is `active (running)`, swap is active, and `oom_score_adj` equals **`-900`**.
+Confirm `xray` (`:8443`) and `xray-xhttp` (`:8444`) are `active (running)`, swap is active, and `oom_score_adj` equals **`-900`**. Note: when using `XHTTP`, client `vless` `users[].flow` **must be omitted/empty** (never leave `xtls-rprx-vision` set), otherwise connections fail with `SSL_ERROR_SYSCALL`.
 
-### 7.5 Entry HAProxy & Private VPC `:8443` Path Check
-From Exit, SSH over VPC to Entry (`ssh ubuntu@172.26.1.10`) and verify HAProxy and VPC connectivity to `172.26.2.20:8443`:
+### 7.5 Entry HAProxy & Private VPC `:8444` / `:8443` Path Check
+From Exit, SSH over VPC to Entry (`ssh ubuntu@172.26.1.10`) and verify HAProxy and VPC connectivity to `172.26.2.20:8444` (XHTTP) and `:8443` (Vision):
 ```bash
 systemctl status haproxy --no-pager
+nc -vz -w 3 172.26.2.20 8444
 nc -vz -w 3 172.26.2.20 8443
 sudo haproxy -c -f /etc/haproxy/haproxy.cfg
 ```
-- **Common Pitfall**: Verify both `use_backend` and `default_backend` in `/etc/haproxy/haproxy.cfg` point to **`172.26.2.20:8443`** (not a legacy `:443` backend, which fails if client fragmentation corrupts SNI parsing or Exit `:443` is removed).
+- **Common Pitfall**: Verify `frontend reality_in` in `/etc/haproxy/haproxy.cfg` routes `XHTTP` SNIs (`cognito-idp.ap-northeast-1.amazonaws.com`, etc.) and `default_backend` to **`172.26.2.20:8444`**, and any legacy `Vision` SNIs (`d1.awsstatic.com`, etc.) to `172.26.2.20:8443`.
 
 ### 7.6 Cross-Border SSH (`vps-jump` / `vps-entry`) & `autossh` Pitfalls
 1. **`ssh vps-jump` fails while `10808` is healthy**: Verify Exit's IPv4 firewall on `TCP 22` includes Exit's own Static Public IP **`203.0.113.20/32`** (required for 1:1 cloud NAT hairpinning) plus `172.26.0.0/20`.

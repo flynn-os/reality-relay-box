@@ -21,7 +21,7 @@ set -u
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-10808}"
 PAUSE_FLAG="${PAUSE_FLAG:-$HOME/.local/state/v2ray-proxy-watchdog.pause}"
-DEFAULT_IGNORE_HOSTS="['localhost', '127.0.0.1', '::1', '192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12', '100.64.0.0/10', '*.local', '*.ts.net']"
+DEFAULT_IGNORE_HOSTS="['localhost', '127.0.0.1', '::1', '192.168.0.0/16', '10.0.0.0/8', '172.16.0.0/12', '100.64.0.0/10', '*.local', '*.ts.net', 'dingtalk.com', '*.dingtalk.com', '*.dingtalkapps.com', '*.alibabainc.com', '*.alicdn.com', '*.aliyuncs.com']"
 LOG="$HOME/.local/logs/v2rayn-keepalive.log"
 mkdir -p "$(dirname "$LOG")"
 
