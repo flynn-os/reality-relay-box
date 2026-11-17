@@ -48,6 +48,7 @@ service_proxy_ok() {
   networksetup -getsecurewebproxy "$svc" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
   networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | grep -q "Enabled: Yes" || return 1
   networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | grep -q "Port: $PROXY_PORT" || return 1
+  networksetup -getproxybypassdomains "$svc" 2>/dev/null | grep -Fq "dingtalk.com" || return 1
 }
 
 restore_service_proxy() {

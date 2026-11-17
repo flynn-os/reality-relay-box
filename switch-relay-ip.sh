@@ -111,6 +111,20 @@ if os.path.exists(gui_cfg):
         g = json.load(f)
     if "CoreBasicItem" in g:
         g["CoreBasicItem"]["EnableFragment"] = False
+    sp = g.get("SystemProxyItem")
+    if isinstance(sp, dict) and sp.get("SystemProxyExceptions") is not None:
+        cur = [x.strip() for x in str(sp.get("SystemProxyExceptions") or "").split(",") if x.strip()]
+        for item in (
+            "dingtalk.com",
+            "*.dingtalk.com",
+            "*.dingtalkapps.com",
+            "*.alibabainc.com",
+            "*.alicdn.com",
+            "*.aliyuncs.com",
+        ):
+            if item not in cur:
+                cur.append(item)
+        sp["SystemProxyExceptions"] = ",".join(cur)
     with open(gui_cfg, "w", encoding="utf-8") as f:
         json.dump(g, f, indent=2, ensure_ascii=False)
     os.chmod(gui_cfg, 0o600)
@@ -173,19 +187,76 @@ if [ "$PID_COUNT" -gt 1 ] && [ "$FORCE_RESTART" -ne 1 ]; then
   exit 0
 fi
 
-if [ -n "$PID_LIST" ]; then
-  # shellcheck disable=SC2086
-  kill -TERM $PID_LIST 2>/dev/null || true
-  sleep 0.2
+spawn_detached_xray() {
+  local cfg="$1"
+  python3 - "$XRAY_BIN" "$ASSET_DIR" "$V2RAYN_DIR/binConfigs" "$cfg" <<'PY'
+import os, subprocess, sys
+xray_bin, asset_dir, work_dir, cfg_path = sys.argv[1:5]
+env = os.environ.copy()
+env["XRAY_LOCATION_ASSET"] = asset_dir
+p = subprocess.Popen(
+    [xray_bin, "run", "-c", cfg_path],
+    cwd=work_dir,
+    env=env,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+print(p.pid)
+PY
+}
+
+OLD_PIDS_SPACE=" $(printf '%s' "$PID_LIST" | tr '\n' ' ') "
+
+if [ "$(uname -s)" = "Darwin" ] && [ -d "/Applications/v2rayN.app" ]; then
+  GUARD_CFG="$V2RAYN_DIR/binConfigs/.config.guard.json"
+  cp "$BIN_CFG" "$GUARD_CFG"
+  chmod 600 "$GUARD_CFG"
+  GUARD_PID="$(spawn_detached_xray "$GUARD_CFG")"
+  sleep 0.5
+
+  launchctl kickstart -k "gui/$(id -u)/com.fei.v2ray-keepalive" >/dev/null 2>&1 || true
+  osascript -e 'tell application "v2rayN" to quit' >/dev/null 2>&1 || pkill -x v2rayN 2>/dev/null || true
+  for old_pid in $PID_LIST; do
+    kill -TERM "$old_pid" 2>/dev/null || true
+  done
+  sleep 0.5
+
+  open -a v2rayN
+  NEW_V2RAYN_XRAY=""
+  for _ in $(seq 1 20); do
+    for cand in $(lsof -nP -t -iTCP:10808 -sTCP:LISTEN 2>/dev/null || true); do
+      if [ "$cand" != "$GUARD_PID" ] && [ "${OLD_PIDS_SPACE#* $cand }" = "$OLD_PIDS_SPACE" ]; then
+        NEW_V2RAYN_XRAY="$cand"
+        break
+      fi
+    done
+    [ -n "$NEW_V2RAYN_XRAY" ] && break
+    sleep 0.5
+  done
+
+  if [ -n "$NEW_V2RAYN_XRAY" ]; then
+    kill -TERM "$GUARD_PID" 2>/dev/null || true
+    rm -f "$GUARD_CFG"
+    chmod 600 "$BIN_CFG" 2>/dev/null || true
+  else
+    echo "[!] v2rayN did not spawn a new xray listener within 10s; keeping detached guard PID ${GUARD_PID} active on :10808." >&2
+  fi
+else
+  NEW_XRAY_PID="$(spawn_detached_xray "$BIN_CFG")"
+  sleep 0.4
+  for old_pid in $PID_LIST; do
+    if [ "$old_pid" != "$NEW_XRAY_PID" ]; then
+      kill -TERM "$old_pid" 2>/dev/null || true
+    fi
+  done
+  rm -f "$V2RAYN_DIR/binConfigs/.config.guard.json"
 fi
 
-(
-  cd "$V2RAYN_DIR/binConfigs"
-  XRAY_LOCATION_ASSET="$ASSET_DIR" nohup "$XRAY_BIN" run -c config.json </dev/null >/dev/null 2>&1 &
-)
 sleep 1
 echo "[+] Verifying proxy connectivity via 127.0.0.1:10808..."
-curl -s -m 6 -x http://127.0.0.1:10808 -o /dev/null -w "[+] HTTP 204 check: %{http_code}\n" https://www.gstatic.com/generate_204
+curl -s -m 6 -x http://127.0.0.1:10808 -o /dev/null -w "[+] HTTP 204 check: %{http_code}\n" https://www.gstatic.com/generate_204 || echo "[!] HTTP 204 check failed"
 echo -n "[+] Current Fixed Egress IP: "
-curl -s -m 6 -x http://127.0.0.1:10808 https://ip.me
+curl -s -m 6 -x http://127.0.0.1:10808 https://ip.me || echo "ERR"
 echo
